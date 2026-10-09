@@ -7,6 +7,19 @@ use eframe::egui::{self, Color32, CornerRadius, FontData, FontFamily, FontId, Ma
 
 pub use egui_phosphor::regular as icon;
 
+/// A connection's colour tag: the strong colour and a light tint for backgrounds.
+pub fn conn_color(c: dbm_core::config::ConnColor) -> (Color32, Color32) {
+    use dbm_core::config::ConnColor::*;
+    match c {
+        Red => (Color32::from_rgb(220, 60, 60), Color32::from_rgb(253, 232, 232)),
+        Orange => (Color32::from_rgb(232, 128, 30), Color32::from_rgb(254, 239, 222)),
+        Yellow => (Color32::from_rgb(214, 172, 20), Color32::from_rgb(253, 246, 214)),
+        Green => (Color32::from_rgb(52, 160, 80), Color32::from_rgb(228, 245, 232)),
+        Blue => (Color32::from_rgb(50, 120, 220), Color32::from_rgb(226, 238, 252)),
+        Purple => (Color32::from_rgb(130, 80, 210), Color32::from_rgb(240, 232, 252)),
+    }
+}
+
 /// Palette shared by the custom-drawn parts of the UI.
 pub mod color {
     use eframe::egui::Color32;

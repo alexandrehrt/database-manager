@@ -11,6 +11,36 @@ pub struct DataSourceConfig {
     pub id: String,
     pub name: String,
     pub kind: DataSourceKind,
+    /// Colour tag shown on the connection's tabs, e.g. red for production.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<ConnColor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnColor {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+}
+
+impl ConnColor {
+    pub const ALL: [ConnColor; 6] =
+        [ConnColor::Red, ConnColor::Orange, ConnColor::Yellow, ConnColor::Green, ConnColor::Blue, ConnColor::Purple];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnColor::Red => "Red",
+            ConnColor::Orange => "Orange",
+            ConnColor::Yellow => "Yellow",
+            ConnColor::Green => "Green",
+            ConnColor::Blue => "Blue",
+            ConnColor::Purple => "Purple",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

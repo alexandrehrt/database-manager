@@ -7,7 +7,7 @@ use dbm_core::{Dialect, ResultSet, Value, export};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_extras::{Column, TableBuilder};
 
-use crate::ui::edits::{Edits, RowRef};
+use crate::ui::edits::{self, Edits, RowRef};
 use crate::ui::theme::{self, color, icon};
 
 /// The cell being edited and its text so far.
@@ -132,6 +132,8 @@ pub struct GridOptions<'a> {
     /// current sort for the header arrows, and header clicks are reported as
     /// [`GridEvent::SortBy`] instead of sorting the loaded rows.
     pub server_sort: Option<Option<(usize, bool)>>,
+    /// Table data: cells offer "Filter by this value".
+    pub filterable: bool,
 }
 
 /// Navigation the caller performs, in data-row terms.
@@ -142,6 +144,8 @@ pub enum GridEvent {
     Referencing { row: usize, key: usize },
     /// Show column `col` of the selected row in the value viewer.
     ViewValue(usize),
+    /// Add a filter on column `col` equal to row `row`'s value.
+    FilterBy(usize, usize),
     /// Header of column `col` clicked while sorting is server-side.
     SortBy(usize),
 }
@@ -242,7 +246,8 @@ pub fn checkbox_glyph(ui: &mut egui::Ui, checked: bool) -> egui::Response {
 /// edited (double-click; checkboxes toggle), set to NULL and reverted, rows
 /// deleted, and added rows are shown after the fetched ones.
 pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridOptions<'_>) -> Option<GridEvent> {
-    let GridOptions { id, columns, is_link, mut edit, selection, dialect, table, referencing, server_sort } = opts;
+    let GridOptions { id, columns, is_link, mut edit, selection, dialect, table, referencing, server_sort, filterable } =
+        opts;
     let meta = |c: usize| columns.get(c).cloned().unwrap_or_default();
     let shown_sort = server_sort.unwrap_or(sort.column);
     sort.refresh(rs);
@@ -421,11 +426,16 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                     let text = std::mem::take(&mut cell.buffer);
                                     *e.editing = None;
                                     // Typed booleans become real ones, so the cell shows a checkbox.
-                                    let value = match parse_bool(&text).filter(|_| m.boolean) {
-                                        Some(b) => Value::Bool(b),
-                                        None => Value::Text(text),
-                                    };
-                                    e.edits.set(rs, row_ref, c, value);
+                                    let was_null = value.as_ref().is_none_or(|v| v.is_null());
+                                    match parse_bool(&text).filter(|_| m.boolean) {
+                                        Some(b) => e.edits.set(rs, row_ref, c, Value::Bool(b)),
+                                        // Nothing typed into a new row's untouched cell: keep its default.
+                                        None if text.is_empty() && value.is_none() => {}
+                                        None => {
+                                            let typed = edits::typed_value(text, &rs.columns[c].type_name, was_null);
+                                            e.edits.set(rs, row_ref, c, typed);
+                                        }
+                                    }
                                 }
                                 return;
                             }
@@ -442,15 +452,27 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 egui::Layout::left_to_right(egui::Align::Center)
                             };
                             let mut toggled = false;
+                            let mut set_new_bool = false;
                             // The whole cell selects the row. Registered before the content
                             // so links and checkboxes, added later, sit on top and get their clicks.
                             let whole = ui.interact(cell, ui.id().with(("cell", idx, c)), egui::Sense::click());
                             let response = ui
                                 .with_layout(layout, |ui| match (&value, boolean) {
+                                    // A new row's boolean starts as an unticked box (its default until clicked).
+                                    (None, _) if m.boolean => {
+                                        let r = checkbox_glyph(ui, false).on_hover_text("Default; click to set");
+                                        if r.clicked() && edit.is_some() {
+                                            set_new_bool = true;
+                                        }
+                                        r
+                                    }
                                     (None, _) => {
                                         let placeholder = if m.primary_key { "auto" } else { "default" };
                                         ui.label(RichText::new(placeholder).font(mono.clone()).color(color::TEXT_FAINT))
                                     }
+                                    (Some(Value::Text(t)), None) if t.is_empty() => ui
+                                        .label(RichText::new("''").font(mono.clone()).color(color::TEXT_FAINT))
+                                        .on_hover_text("Empty string"),
                                     (Some(Value::Null), _) => theme::pill(
                                         ui,
                                         RichText::new("NULL").size(10.0).color(color::TEXT_WEAK),
@@ -478,6 +500,9 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 .inner;
                             if toggled && let (Some(e), Some(b)) = (edit.as_mut(), boolean) {
                                 e.edits.set(rs, row_ref, c, Value::Bool(!b));
+                            }
+                            if set_new_bool && let Some(e) = edit.as_mut() {
+                                e.edits.set(rs, row_ref, c, Value::Bool(true));
                             }
                             if let Some(r) = link
                                 && response.clicked()
@@ -523,6 +548,20 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 }
                                 if matches!(row_ref, RowRef::Existing(_)) && ui.button("View value").clicked() {
                                     event = Some(GridEvent::ViewValue(c));
+                                }
+                                if filterable
+                                    && let RowRef::Existing(r) = row_ref
+                                    && !matches!(rs.rows[r][c], Value::Json(_) | Value::Bytes(_) | Value::Array(_))
+                                {
+                                    let shown: String = cell_text(&rs.rows[r][c]).chars().take(30).collect();
+                                    let label = if rs.rows[r][c].is_null() {
+                                        format!("Filter: {} IS NULL", rs.columns[c].name)
+                                    } else {
+                                        format!("Filter: {} = {shown}", rs.columns[c].name)
+                                    };
+                                    if ui.button(label).clicked() {
+                                        event = Some(GridEvent::FilterBy(r, c));
+                                    }
                                 }
                                 if ui.button("Copy value").clicked() {
                                     let copied = match &value {

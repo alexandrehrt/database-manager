@@ -242,6 +242,8 @@ pub struct Console {
     /// Cmd+S this frame: saves grid edits if there are any, else the file.
     save_requested: bool,
     find: Option<FindBar>,
+    /// A run held for confirmation: UPDATE / DELETE statements without WHERE.
+    unrestricted: Option<(ConsoleAction, Vec<String>)>,
     editor_collapsed: bool,
     panel_open: bool,
     panel: Option<RowPanel>,
@@ -310,6 +312,7 @@ impl Console {
             saved_text: None,
             save_requested: false,
             find: None,
+            unrestricted: None,
             editor_collapsed: false,
             panel_open: true,
             panel: None,
@@ -365,6 +368,7 @@ impl Console {
         let (save_as, save) = ui.input_mut(|i| (i.consume_shortcut(&SAVE_AS), i.consume_shortcut(&SAVE)));
         self.save_requested = save;
         let action = self.show_inner(ui, cx);
+        let action = self.hold_unrestricted(action).or_else(|| self.unrestricted_modal(ui));
         // Cmd+S not taken by pending grid edits saves the file.
         if std::mem::take(&mut self.save_requested) {
             self.save_file(false);
@@ -1469,8 +1473,10 @@ impl Console {
             table: table.as_deref(),
             referencing: &referencing,
             server_sort,
+            filterable: server_sort.is_some(),
         };
         let mut sort_request = None;
+        let mut filter_request = None;
         let mut action = None;
         let event = grid::show(ui, rs, &mut tab.sort, opts);
         // The open value viewer follows the clicked cell.
@@ -1487,6 +1493,16 @@ impl Console {
                 }
             }
             Some(GridEvent::SortBy(col)) => sort_request = Some((col, rs.columns[col].name.clone())),
+            Some(GridEvent::FilterBy(row, col)) => {
+                let value = &rs.rows[row][col];
+                let column = dialect.quote_ident(&rs.columns[col].name);
+                let condition = if value.is_null() {
+                    format!("{column} IS NULL")
+                } else {
+                    format!("{column} = {}", dbm_core::export::sql_literal(dialect, value))
+                };
+                filter_request = Some(condition);
+            }
             Some(GridEvent::ViewValue(col)) => {
                 self.value_col = Some(col);
                 self.panel_open = true;
@@ -1502,6 +1518,14 @@ impl Console {
         }
         if let Some((col, name)) = sort_request {
             action = self.sort_table_by(col, &name);
+        }
+        if let Some(condition) = filter_request
+            && let Some(tv) = &mut self.table
+        {
+            if !tv.filters.contains(&condition) {
+                tv.filters.push(condition);
+            }
+            action = self.filter_run();
         }
         action
     }
@@ -1579,6 +1603,10 @@ impl Console {
                         };
                         ui.label(RichText::new(shown).font(theme::font(12.5, theme::semibold())));
                         ui.label(RichText::new(format!("· {} ms", tab.elapsed.as_millis())).color(color::TEXT_WEAK));
+                        let selected = tab.selection.rows.len();
+                        if selected > 0 {
+                            ui.label(RichText::new(format!("· {selected} selected")).color(color::ACCENT_TEXT));
+                        }
                         if rs.truncated && is_read_only_query(&tab.sql) {
                             if ui.add_enabled(!running, egui::Link::new("Load more")).clicked() {
                                 action = Some(ConsoleAction::Run {
@@ -1712,6 +1740,57 @@ impl Console {
     }
 
     /// Holds `action` behind a confirmation when it would discard pending edits.
+    /// Holds a run with an UPDATE / DELETE that has no WHERE until confirmed.
+    fn hold_unrestricted(&mut self, action: Option<ConsoleAction>) -> Option<ConsoleAction> {
+        let a = action?;
+        let ConsoleAction::Run { statements, mode: RunMode::Fresh, .. } = &a else { return Some(a) };
+        let targets: Vec<String> =
+            statements.iter().filter_map(|(sql, _)| sql_format::unrestricted_write(sql)).collect();
+        if targets.is_empty() {
+            return Some(a);
+        }
+        self.unrestricted = Some((a, targets));
+        None
+    }
+
+    fn unrestricted_modal(&mut self, ui: &egui::Ui) -> Option<ConsoleAction> {
+        let (_, targets) = self.unrestricted.as_ref()?;
+        let mut decision = None;
+        let modal = egui::Modal::new(egui::Id::new(("unrestricted", self.id))).show(ui.ctx(), |ui| {
+            ui.set_width(420.0);
+            ui.heading("Change every row?");
+            ui.add_space(6.0);
+            let one = targets.len() == 1;
+            ui.label(if one {
+                "This statement has no WHERE clause, so it affects every row of the table:"
+            } else {
+                "These statements have no WHERE clause, so they affect every row of their tables:"
+            });
+            ui.add_space(4.0);
+            for t in targets {
+                ui.label(RichText::new(format!("•  {t}")).font(theme::mono(12.5)));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let run = egui::Button::new(RichText::new("Run anyway").color(Color32::WHITE)).fill(color::DANGER);
+                    if ui.add(run).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        });
+        if decision.is_none() && modal.should_close() {
+            decision = Some(false);
+        }
+        let proceed = decision?;
+        let (action, _) = self.unrestricted.take()?;
+        proceed.then_some(action).filter(|_| self.run.is_none())
+    }
+
     fn guarded(&mut self, action: Option<ConsoleAction>, before: Snapshot) -> Option<ConsoleAction> {
         let a = action?;
         let tabs = self.discarded_by(&a);
@@ -1958,7 +2037,9 @@ impl Console {
                         };
                         if can_edit {
                             if edit(buffer, ui).changed() {
-                                tab.edits.set(rs, RowRef::Existing(row), c, Value::Text(buffer.clone()));
+                                let typed =
+                                    edits::typed_value(buffer.clone(), &rs.columns[c].type_name, original.is_null());
+                                tab.edits.set(rs, RowRef::Existing(row), c, typed);
                             }
                         } else {
                             // Read-only values stay selectable through an immutable buffer.
@@ -2036,7 +2117,9 @@ impl Console {
                             })
                             .inner;
                         if r.changed() {
-                            tab.edits.set(rs, RowRef::Existing(row), c, Value::Text(panel.buffers[c].clone()));
+                            let typed =
+                                edits::typed_value(panel.buffers[c].clone(), &col.type_name, rs.rows[row][c].is_null());
+                            tab.edits.set(rs, RowRef::Existing(row), c, typed);
                         }
                         if can_edit {
                             r.context_menu(|ui| {

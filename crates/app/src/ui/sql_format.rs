@@ -473,3 +473,44 @@ pub fn find_all(hay: &str, needle: &str, case_sensitive: bool) -> Vec<std::ops::
     }
     out
 }
+
+/// For an UPDATE or DELETE without a WHERE clause: what it targets, such as
+/// "DELETE FROM orders", for a confirmation. None for anything else.
+pub fn unrestricted_write(sql: &str) -> Option<String> {
+    let (toks, _): (Vec<Tok<'_>>, Vec<bool>) = tokenize(sql).into_iter().unzip();
+    let words = |t: &Tok<'_>| if let Tok::Word(w) = t { Some(w.to_ascii_uppercase()) } else { None };
+    let first = toks.iter().find_map(words)?;
+    if first != "UPDATE" && first != "DELETE" {
+        return None;
+    }
+    let mut depth = 0usize;
+    for t in &toks {
+        match t {
+            Tok::Punct("(") => depth += 1,
+            Tok::Punct(")") => depth = depth.saturating_sub(1),
+            Tok::Word(w) if depth == 0 && w.eq_ignore_ascii_case("WHERE") => return None,
+            _ => {}
+        }
+    }
+    // The verb (with FROM / ONLY) upper-cased, then the table name as written.
+    let mut head = Vec::new();
+    let mut rest = toks.iter().skip_while(|t| words(t).is_none()).peekable();
+    while let Some(Tok::Word(w)) = rest.peek() {
+        if !matches!(w.to_ascii_uppercase().as_str(), "UPDATE" | "DELETE" | "FROM" | "ONLY") {
+            break;
+        }
+        head.push(w.to_ascii_uppercase());
+        rest.next();
+    }
+    let mut name = String::new();
+    for t in rest {
+        match t {
+            Tok::Word(_) | Tok::Verbatim(_) if !name.is_empty() && !name.ends_with('.') => break,
+            Tok::Word(w) | Tok::Verbatim(w) => name.push_str(w),
+            Tok::Punct(".") => name.push('.'),
+            _ => break,
+        }
+    }
+    head.push(name);
+    Some(head.join(" "))
+}

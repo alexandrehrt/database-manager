@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use dbm_core::config::{DataSourceConfig, DataSourceKind, SslMode};
+use dbm_core::config::{ConnColor, DataSourceConfig, DataSourceKind, SslMode};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, Stroke};
 
 use crate::ui::theme::{self, color, icon};
@@ -28,6 +28,7 @@ pub struct DataSourceDialog {
     /// `Some(id)` when editing an existing source.
     editing: Option<String>,
     name: String,
+    color: Option<ConnColor>,
     engine: Engine,
     host: String,
     port: String,
@@ -66,6 +67,7 @@ impl DataSourceDialog {
         Self {
             editing: None,
             name: String::new(),
+            color: None,
             engine: Engine::Postgres,
             host: "localhost".into(),
             port: "5432".into(),
@@ -87,6 +89,7 @@ impl DataSourceDialog {
         let mut d = Self::new();
         d.editing = Some(config.id.clone());
         d.name = config.name.clone();
+        d.color = config.color;
         match &config.kind {
             DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
                 d.engine = Engine::Postgres;
@@ -159,7 +162,7 @@ impl DataSourceDialog {
             n => n.to_string(),
         };
         let id = self.editing.clone().unwrap_or_else(new_id);
-        Ok(DataSourceConfig { id, name, kind })
+        Ok(DataSourceConfig { id, name, kind, color: self.color })
     }
 
     fn save(&mut self, connect: bool) -> Option<DialogAction> {
@@ -410,8 +413,43 @@ impl DataSourceDialog {
     fn identification(&mut self, ui: &mut egui::Ui) {
         section(ui, "Identification");
         let placeholder = self.kind().map(|k| default_name(&k)).unwrap_or_default();
-        let full = CONTENT;
-        labeled(ui, "Name", full, |ui| input(ui, &mut self.name, &placeholder));
+        let swatches = 6.0 * 26.0 + 30.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            labeled(ui, "Name", CONTENT - swatches - 12.0, |ui| input(ui, &mut self.name, &placeholder));
+            labeled(ui, "Colour", swatches, |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(30.0);
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let none = ui
+                        .add(
+                            egui::Button::new(RichText::new(icon::PROHIBIT).color(color::TEXT_WEAK))
+                                .selected(self.color.is_none())
+                                .min_size(egui::vec2(22.0, 22.0)),
+                        )
+                        .on_hover_text("No colour");
+                    if none.clicked() {
+                        self.color = None;
+                    }
+                    for c in ConnColor::ALL {
+                        let (strong, _) = theme::conn_color(c);
+                        let (rect, r) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                        ui.painter().circle_filled(rect.center(), 8.0, strong);
+                        if self.color == Some(c) {
+                            ui.painter().circle_stroke(rect.center(), 10.5, Stroke::new(2.0, strong));
+                        }
+                        if r.on_hover_text(c.label()).clicked() {
+                            self.color = Some(c);
+                        }
+                    }
+                });
+            });
+        });
+        ui.label(
+            RichText::new("Tabs of this connection are tinted with its colour, e.g. red for production.")
+                .small()
+                .color(color::TEXT_WEAK),
+        );
     }
 
     /// Test result and validation errors.
