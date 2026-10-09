@@ -17,7 +17,7 @@ use crate::ui::completion::{self, Catalog, Item};
 use crate::ui::edits::{self, EditStatement, EditTarget, Edits, RowRef};
 use crate::ui::grid::{self, ColumnMeta, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
 use crate::ui::theme::{self, color, icon};
-use crate::ui::{editor_ops, inspect, sql_format, sql_highlight};
+use crate::ui::{diagram, editor_ops, inspect, sql_format, sql_highlight};
 
 pub const PAGE_SIZE: usize = 500;
 
@@ -282,6 +282,8 @@ pub struct Console {
     /// A run held for confirmation: UPDATE / DELETE statements without WHERE.
     unrestricted: Option<(ConsoleAction, Vec<(String, &'static str)>)>,
     param_prompt: Option<ParamPrompt>,
+    /// Set for a schema diagram tab, which has no editor.
+    pub diagram: Option<diagram::Diagram>,
     /// Inspection results for the editor text, and what they were computed
     /// from (text, loaded tables, loaded table details).
     issues: Vec<inspect::Issue>,
@@ -322,6 +324,11 @@ pub enum ConsoleAction {
     Rollback,
     /// Ask the app to open a `.sql` file in a new console.
     OpenFile,
+    /// Open a table's data (from the diagram).
+    OpenTable {
+        schema: String,
+        table: String,
+    },
     /// Apply the pending edits of result tab `tab`.
     SubmitEdits {
         tab: usize,
@@ -368,6 +375,7 @@ impl Console {
             find: None,
             unrestricted: None,
             param_prompt: None,
+            diagram: None,
             issues: Vec::new(),
             inspected: None,
             param_values: HashMap::new(),
@@ -447,6 +455,10 @@ impl Console {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
+        // A diagram has no SQL to save, run or guard.
+        if self.diagram.is_some() {
+            return self.show_inner(ui, cx);
+        }
         let before = (self.sql.clone(), self.table.as_ref().map(|t| (t.filters.clone(), t.order.clone(), t.sort)));
         // Save As first: Cmd+S also matches Shift+Cmd+S logically.
         let (save_as, save) = ui.input_mut(|i| (i.consume_shortcut(&SAVE_AS), i.consume_shortcut(&SAVE)));
@@ -467,6 +479,9 @@ impl Console {
     }
 
     fn show_inner(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
+        if self.diagram.is_some() {
+            return self.diagram_view(ui, cx);
+        }
         match self.table.as_ref().map(|t| t.mode) {
             Some(ViewMode::Structure) => {
                 self.structure_view(ui, cx);
@@ -496,6 +511,27 @@ impl Console {
         }
         self.view_sql_modal(ui);
         action
+    }
+
+    /// The schema diagram: asks for the details of tables not loaded yet and
+    /// draws the ones that are.
+    fn diagram_view(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
+        let d = self.diagram.as_mut()?;
+        let schema = d.schema.clone();
+        let names: Vec<&String> = cx.catalog.tables.iter().filter(|(s, _)| *s == schema).map(|(_, t)| t).collect();
+        let mut loaded = Vec::new();
+        for name in &names {
+            match cx.catalog.details.get(&(schema.clone(), (*name).clone())) {
+                Some(details) => loaded.push(details),
+                None => {
+                    if d.requested.insert((*name).clone()) {
+                        self.wanted_details.push((schema.clone(), (*name).clone()));
+                    }
+                }
+            }
+        }
+        d.show(ui, &loaded, names.len())
+            .map(|diagram::DiagramEvent::OpenTable(table)| ConsoleAction::OpenTable { schema, table })
     }
 
     // ----- editor -------------------------------------------------------

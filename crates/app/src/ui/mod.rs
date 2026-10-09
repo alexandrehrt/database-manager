@@ -1,6 +1,7 @@
 pub mod completion;
 pub mod console;
 pub mod datasource_dialog;
+pub mod diagram;
 pub mod editor_ops;
 pub mod edits;
 pub mod explorer;

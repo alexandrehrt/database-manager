@@ -276,6 +276,16 @@ fn objects(
         Loadable::Loaded(rels) => rels,
     };
     let schema = node.name.clone();
+    if filter.is_empty() {
+        ui.add_space(6.0);
+        let diagram = row(ui, false, |ui| {
+            ui.label(RichText::new(icon::TREE_STRUCTURE).color(color::TEXT_WEAK));
+            ui.label(RichText::new("Schema diagram").color(color::TEXT_WEAK));
+        });
+        if diagram.on_hover_text("Tables and their foreign keys").clicked() {
+            actions.push(Action::OpenDiagram { source: source.to_string(), schema: schema.clone(), focus: None });
+        }
+    }
     for (title, kinds, glyph) in [
         ("Tables", &[RelationKind::Table][..], icon::TABLE),
         ("Views", &[RelationKind::View, RelationKind::MaterializedView][..], icon::EYE),
@@ -300,6 +310,13 @@ fn objects(
             response.context_menu(|ui| {
                 if ui.button("Open data").clicked() {
                     actions.push(open());
+                }
+                if ui.button("Show in diagram").clicked() {
+                    actions.push(Action::OpenDiagram {
+                        source: source.to_string(),
+                        schema: schema.clone(),
+                        focus: Some(rel.name.clone()),
+                    });
                 }
                 if ui.button("Show DDL").clicked() {
                     actions.push(Action::ShowDdl {
