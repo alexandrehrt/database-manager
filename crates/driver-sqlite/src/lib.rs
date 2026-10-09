@@ -298,6 +298,10 @@ impl Connection for SqliteConnection {
     fn canceller(&self) -> Arc<dyn Canceller> {
         Arc::new(SqliteCanceller(self.interrupt.clone()))
     }
+
+    async fn in_transaction(&self) -> bool {
+        self.blocking(|c| Ok(!c.is_autocommit())).await.unwrap_or(false)
+    }
 }
 
 struct SqliteCanceller(Arc<InterruptHandle>);

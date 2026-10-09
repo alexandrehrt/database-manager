@@ -17,14 +17,57 @@ use crate::persist;
 pub type SharedConnection = Arc<dyn Connection>;
 
 pub enum Event {
-    Connected { source: String, result: DbResult<SharedConnection> },
-    Tested { nonce: u64, result: DbResult<String> },
-    Schemas { source: String, result: DbResult<Vec<String>> },
-    Relations { source: String, schema: String, result: DbResult<Vec<Relation>> },
-    Details { source: String, schema: String, table: String, result: DbResult<TableDetails> },
-    StatementDone { console: u64, run: u64, index: usize, result: StatementResult },
-    RunFinished { console: u64, run: u64 },
-    Ddl { tab: u64, result: DbResult<String> },
+    Connected {
+        source: String,
+        result: DbResult<SharedConnection>,
+    },
+    Tested {
+        nonce: u64,
+        result: DbResult<String>,
+    },
+    Schemas {
+        source: String,
+        result: DbResult<Vec<String>>,
+    },
+    Relations {
+        source: String,
+        schema: String,
+        result: DbResult<Vec<Relation>>,
+    },
+    Details {
+        source: String,
+        schema: String,
+        table: String,
+        result: DbResult<TableDetails>,
+    },
+    ConsoleConnected {
+        console: u64,
+        result: DbResult<SharedConnection>,
+    },
+    /// `in_transaction` is the console connection's state after the statement.
+    StatementDone {
+        console: u64,
+        run: u64,
+        index: usize,
+        result: StatementResult,
+        in_transaction: bool,
+    },
+    RunFinished {
+        console: u64,
+        run: u64,
+        in_transaction: bool,
+    },
+    /// A COMMIT / ROLLBACK issued from the console toolbar.
+    ControlDone {
+        console: u64,
+        sql: &'static str,
+        result: DbResult<()>,
+        in_transaction: bool,
+    },
+    Ddl {
+        tab: u64,
+        result: DbResult<String>,
+    },
 }
 
 pub struct Worker {
@@ -32,7 +75,10 @@ pub struct Worker {
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     ctx: egui::Context,
+    /// Per data source, used by the explorer and metadata lookups.
     connections: HashMap<String, SharedConnection>,
+    /// Per console, so each console's transaction is its own.
+    console_connections: HashMap<u64, SharedConnection>,
 }
 
 impl Worker {
@@ -44,7 +90,7 @@ impl Worker {
             .build()
             .expect("failed to start tokio runtime");
         let (tx, rx) = mpsc::channel();
-        Self { rt, tx, rx, ctx, connections: HashMap::new() }
+        Self { rt, tx, rx, ctx, connections: HashMap::new(), console_connections: HashMap::new() }
     }
 
     pub fn try_recv(&self) -> Option<Event> {
@@ -72,6 +118,24 @@ impl Worker {
         self.connections.remove(source);
     }
 
+    pub fn console_connection(&self, console: u64) -> Option<SharedConnection> {
+        self.console_connections.get(&console).cloned()
+    }
+
+    pub fn register_console(&mut self, console: u64, conn: SharedConnection) {
+        self.console_connections.insert(console, conn);
+    }
+
+    /// Dropping the last handle closes the connection, which rolls back any
+    /// open transaction on the server.
+    pub fn close_console(&mut self, console: u64) {
+        self.console_connections.remove(&console);
+    }
+
+    pub fn connect_console(&self, console: u64, config: DataSourceConfig, password: Option<String>) {
+        self.spawn(async move { Event::ConsoleConnected { console, result: open(&config, password).await } });
+    }
+
     /// `password` overrides the keychain; `None` reads the saved one.
     pub fn connect(&self, config: DataSourceConfig, password: Option<String>) {
         self.spawn(async move {
@@ -91,7 +155,10 @@ impl Worker {
     }
 
     /// Executes `statements` in order, reporting each as it finishes. Stops
-    /// after the first error or once `stop` is set.
+    /// after the first error or once `stop` is set. With `begin_first`
+    /// (manual transaction mode) a transaction is opened first unless one
+    /// already is.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_statements(
         &self,
         conn: SharedConnection,
@@ -100,9 +167,21 @@ impl Worker {
         statements: Vec<(String, Vec<Value>)>,
         max_rows: usize,
         stop: Arc<AtomicBool>,
+        begin_first: bool,
     ) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
+            if begin_first
+                && !conn.in_transaction().await
+                && let Err(e) = conn.execute("BEGIN", &[], None).await
+            {
+                let result = StatementResult { sql: "BEGIN".into(), outcome: Err(e), elapsed: Default::default() };
+                let in_transaction = conn.in_transaction().await;
+                let _ = tx.send(Event::StatementDone { console, run, index: 0, result, in_transaction });
+                let _ = tx.send(Event::RunFinished { console, run, in_transaction });
+                ctx.request_repaint();
+                return;
+            }
             for (index, (sql, params)) in statements.into_iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -111,14 +190,31 @@ impl Worker {
                 let outcome = conn.execute(&sql, &params, Some(max_rows)).await;
                 let failed = outcome.is_err();
                 let result = StatementResult { sql, outcome, elapsed: started.elapsed() };
-                let _ = tx.send(Event::StatementDone { console, run, index, result });
+                let in_transaction = conn.in_transaction().await;
+                let _ = tx.send(Event::StatementDone { console, run, index, result, in_transaction });
                 ctx.request_repaint();
                 if failed {
                     break;
                 }
             }
-            let _ = tx.send(Event::RunFinished { console, run });
+            let in_transaction = conn.in_transaction().await;
+            let _ = tx.send(Event::RunFinished { console, run, in_transaction });
             ctx.request_repaint();
+        });
+    }
+
+    /// Runs COMMIT or ROLLBACK without producing a results tab.
+    pub fn control(&self, conn: SharedConnection, console: u64, sql: &'static str) {
+        self.spawn(async move {
+            let result = conn.execute(sql, &[], None).await.map(|_| ());
+            Event::ControlDone { console, sql, result, in_transaction: conn.in_transaction().await }
+        });
+    }
+
+    pub fn details(&self, conn: SharedConnection, source: String, schema: String, table: String) {
+        self.spawn(async move {
+            let result = conn.table_details(&schema, &table).await;
+            Event::Details { source, schema, table, result }
         });
     }
 
