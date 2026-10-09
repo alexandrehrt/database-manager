@@ -125,7 +125,14 @@ fn source_node(ui: &mut egui::Ui, source: &DataSourceConfig, tree: &mut SourceTr
     }
 
     let header_response = name_response.on_hover_text(engine);
+    if header_response.double_clicked() {
+        actions.push(Action::NewConsole(id.clone()));
+    }
     header_response.context_menu(|ui| {
+        if ui.button("New console").clicked() {
+            actions.push(Action::NewConsole(id.clone()));
+        }
+        ui.separator();
         if tree.status == ConnStatus::Connected {
             if ui.button("Refresh").clicked() {
                 actions.push(Action::Refresh(id.clone()));
@@ -212,7 +219,8 @@ fn relations(
 
 fn relation_node(ui: &mut egui::Ui, source: &str, schema: &str, node: &mut RelationNode, actions: &mut Vec<Action>) {
     let name = node.relation.name.clone();
-    egui::CollapsingHeader::new(&name)
+    let open_table = || Action::OpenTable { source: source.to_string(), schema: schema.to_string(), table: name.clone() };
+    let response = egui::CollapsingHeader::new(&name)
         .id_salt(("relation", source, schema, &name))
         .show(ui, |ui| match &mut node.details {
             Loadable::NotLoaded => {
@@ -224,7 +232,19 @@ fn relation_node(ui: &mut egui::Ui, source: &str, schema: &str, node: &mut Relat
                 ui.colored_label(ui.visuals().error_fg_color, e.as_str());
             }
             Loadable::Loaded(details) => table_details(ui, details),
-        });
+        })
+        .header_response;
+    if response.double_clicked() {
+        actions.push(open_table());
+    }
+    response.on_hover_text("Double-click to open data").context_menu(|ui| {
+        if ui.button("Open data").clicked() {
+            actions.push(open_table());
+        }
+        if ui.button("Show DDL").clicked() {
+            actions.push(Action::ShowDdl { source: source.to_string(), schema: schema.to_string(), table: name.clone() });
+        }
+    });
 }
 
 fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {

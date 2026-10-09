@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use dbm_core::config::{DataSourceConfig, DataSourceKind};
-use dbm_core::{Connection, DbError, DbResult, Relation, TableDetails};
+use dbm_core::{Connection, DbError, DbResult, Relation, StatementResult, TableDetails};
 use eframe::egui;
 
 use crate::persist;
@@ -20,6 +22,9 @@ pub enum Event {
     Schemas { source: String, result: DbResult<Vec<String>> },
     Relations { source: String, schema: String, result: DbResult<Vec<Relation>> },
     Details { source: String, schema: String, table: String, result: DbResult<TableDetails> },
+    StatementDone { console: u64, run: u64, index: usize, result: StatementResult },
+    RunFinished { console: u64, run: u64 },
+    Ddl { tab: u64, result: DbResult<String> },
 }
 
 pub struct Worker {
@@ -82,6 +87,46 @@ impl Worker {
                 Err(e) => Err(e),
             };
             Event::Tested { nonce, result }
+        });
+    }
+
+    /// Executes `statements` in order, reporting each as it finishes. Stops
+    /// after the first error or once `stop` is set.
+    pub fn run_statements(
+        &self,
+        conn: SharedConnection,
+        console: u64,
+        run: u64,
+        statements: Vec<String>,
+        max_rows: usize,
+        stop: Arc<AtomicBool>,
+    ) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            for (index, sql) in statements.into_iter().enumerate() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let started = Instant::now();
+                let outcome = conn.execute(&sql, &[], Some(max_rows)).await;
+                let failed = outcome.is_err();
+                let result = StatementResult { sql, outcome, elapsed: started.elapsed() };
+                let _ = tx.send(Event::StatementDone { console, run, index, result });
+                ctx.request_repaint();
+                if failed {
+                    break;
+                }
+            }
+            let _ = tx.send(Event::RunFinished { console, run });
+            ctx.request_repaint();
+        });
+    }
+
+    pub fn cancel(&self, conn: SharedConnection) {
+        let canceller = conn.canceller();
+        self.rt.spawn(async move {
+            // A failed cancel request leaves the query running; nothing else to do.
+            let _ = canceller.cancel().await;
         });
     }
 
