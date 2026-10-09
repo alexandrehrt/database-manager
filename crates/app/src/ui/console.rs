@@ -14,7 +14,7 @@ use dbm_core::{DbError, Dialect, ExecOutcome, TableDetails, Value, sql_split};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::ui::edits::{self, EditStatement, Edits};
-use crate::ui::grid::{self, EditingCell, GridEdit, SortState};
+use crate::ui::grid::{self, EditingCell, GridEdit, GridOptions, Selection, SortState};
 use crate::ui::sql_highlight;
 
 pub const PAGE_SIZE: usize = 500;
@@ -35,6 +35,7 @@ pub struct ResultTab {
     /// Row limit the statement ran with; "load more" re-runs it with a larger one.
     pub limit: usize,
     pub sort: SortState,
+    pub selection: Selection,
     pub edits: Edits,
     pub editing: Option<EditingCell>,
     /// A submit is in flight.
@@ -53,6 +54,7 @@ impl ResultTab {
             elapsed: Duration::default(),
             limit: PAGE_SIZE,
             sort: SortState::default(),
+            selection: Selection::default(),
             edits: Edits::default(),
             editing: None,
             submitting: false,
@@ -532,7 +534,16 @@ impl Console {
             let is_link = |row: usize, col: usize| link_for_cell(&rs.columns, &rs.rows[row], col, fks).is_some();
             let edit =
                 matches!(target, Some(Ok(_))).then(|| GridEdit { edits: &mut tab.edits, editing: &mut tab.editing });
-            if let Some((row, col)) = grid::show(ui, (console_id, idx), rs, &mut tab.sort, &is_link, edit)
+            let table = single_table(rs);
+            let opts = GridOptions {
+                id: (console_id, idx),
+                is_link: &is_link,
+                edit,
+                selection: &mut tab.selection,
+                dialect,
+                table: table.as_deref(),
+            };
+            if let Some((row, col)) = grid::show(ui, rs, &mut tab.sort, opts)
                 && !running
                 && let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks)
             {
@@ -543,6 +554,13 @@ impl Console {
         }
         action
     }
+}
+
+/// The table every column of `rs` was read from, if there is exactly one.
+fn single_table(rs: &dbm_core::ResultSet) -> Option<String> {
+    let mut tables = rs.columns.iter().map(|c| c.origin.as_ref().map(|o| &o.table));
+    let first = tables.next()??;
+    tables.all(|t| t == Some(first)).then(|| first.clone())
 }
 
 fn run_fresh(statements: Vec<String>) -> Option<ConsoleAction> {

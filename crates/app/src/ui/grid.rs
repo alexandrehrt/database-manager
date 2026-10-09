@@ -1,7 +1,9 @@
 //! Virtualized results grid with click-to-sort headers and, for editable
 //! results, inline cell editing.
 
-use dbm_core::{ResultSet, Value};
+use std::collections::BTreeSet;
+
+use dbm_core::{Dialect, ResultSet, Value, export};
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
@@ -60,6 +62,93 @@ impl SortState {
     }
 }
 
+/// Selected fetched rows (data indices) and the anchor for Shift+click ranges.
+#[derive(Default)]
+pub struct Selection {
+    pub rows: BTreeSet<usize>,
+    anchor: Option<usize>,
+}
+
+impl Selection {
+    /// Applies a click on the row shown at `display` (data row `row`).
+    fn click(&mut self, display: usize, row: usize, order: &[usize], modifiers: egui::Modifiers) {
+        if modifiers.shift
+            && let Some(anchor) = self.anchor
+        {
+            let (a, b) = (anchor.min(display), anchor.max(display));
+            if !modifiers.command {
+                self.rows.clear();
+            }
+            self.rows.extend(order[a..=b.min(order.len() - 1)].iter().copied());
+        } else if modifiers.command {
+            if !self.rows.remove(&row) {
+                self.rows.insert(row);
+            }
+            self.anchor = Some(display);
+        } else {
+            self.rows = BTreeSet::from([row]);
+            self.anchor = Some(display);
+        }
+    }
+
+    /// Selected rows in the order they are shown.
+    fn in_display_order(&self, order: &[usize]) -> Vec<usize> {
+        order.iter().copied().filter(|r| self.rows.contains(r)).collect()
+    }
+}
+
+/// Everything the grid needs besides the data.
+pub struct GridOptions<'a> {
+    pub id: (u64, usize),
+    /// Marks cells drawn as foreign-key links.
+    pub is_link: &'a dyn Fn(usize, usize) -> bool,
+    /// Present when the result can be edited.
+    pub edit: Option<GridEdit<'a>>,
+    pub selection: &'a mut Selection,
+    pub dialect: Dialect,
+    /// The single table the rows come from, for "Copy as INSERT".
+    pub table: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+enum CopyFormat {
+    Tsv,
+    Csv,
+    Json,
+    Markdown,
+    Insert,
+}
+
+fn copy_rows(
+    ctx: &egui::Context,
+    rs: &ResultSet,
+    rows: &[usize],
+    format: CopyFormat,
+    dialect: Dialect,
+    table: Option<&str>,
+) {
+    let subset = export::subset(rs, rows);
+    let text = match format {
+        CopyFormat::Tsv => export::to_tsv(&subset),
+        CopyFormat::Csv => {
+            let mut buf = Vec::new();
+            if export::write_csv(&subset, &mut buf).is_err() {
+                return;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        CopyFormat::Json => serde_json::to_string_pretty(&export::to_json(&subset)).unwrap_or_default(),
+        CopyFormat::Markdown => export::to_markdown(&subset),
+        CopyFormat::Insert => match table {
+            Some(t) => export::to_inserts(dialect, t, &subset),
+            None => return,
+        },
+    };
+    ctx.copy_text(text);
+}
+
+const SELECT_ALL: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
+
 const MAX_CELL_CHARS: usize = 300;
 
 fn cell_text(v: &Value) -> String {
@@ -70,19 +159,34 @@ fn cell_text(v: &Value) -> String {
     s
 }
 
-/// `is_link(row, col)` marks cells drawn as foreign-key links. Returns the
-/// (row, column) of a link clicked this frame, in data order. With `edit`,
-/// cells can be edited (double-click), set to NULL and reverted, rows
-/// deleted, and added rows are shown after the fetched ones.
-pub fn show(
-    ui: &mut egui::Ui,
-    id: (u64, usize),
-    rs: &ResultSet,
-    sort: &mut SortState,
-    is_link: &dyn Fn(usize, usize) -> bool,
-    mut edit: Option<GridEdit<'_>>,
-) -> Option<(usize, usize)> {
+/// Returns the (row, column) of a foreign-key link clicked this frame, in
+/// data order. Click, Shift+click and Cmd+click select rows; Cmd+A selects
+/// all, Cmd+C copies the selection as TSV and Escape clears it. With
+/// `edit`, cells can be edited (double-click), set to NULL and reverted,
+/// rows deleted, and added rows are shown after the fetched ones.
+pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridOptions<'_>) -> Option<(usize, usize)> {
+    let GridOptions { id, is_link, mut edit, selection, dialect, table } = opts;
     sort.refresh(rs);
+    selection.rows.retain(|&r| r < rs.rows.len());
+
+    // Grid shortcuts apply when no text field has the keyboard.
+    let free = ui.memory(|m| m.focused().is_none());
+    let hovered = ui.rect_contains_pointer(ui.available_rect_before_wrap());
+    if free && hovered {
+        if ui.input_mut(|i| i.consume_shortcut(&SELECT_ALL)) {
+            selection.rows = (0..rs.rows.len()).collect();
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            selection.rows.clear();
+        }
+    }
+    if free && !selection.rows.is_empty() && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+        copy_rows(ui.ctx(), rs, &selection.in_display_order(&sort.order), CopyFormat::Tsv, dialect, table);
+    }
+    let modifiers = ui.input(|i| i.modifiers);
+    let mut clicked_row: Option<(usize, usize)> = None;
+    let mut context_row: Option<usize> = None;
+    let mut copy_request: Option<CopyFormat> = None;
     let added = edit.as_ref().map_or(0, |e| e.edits.inserts.len());
     let mut clicked_link = None;
     let mut clicked_header = None;
@@ -136,9 +240,20 @@ pub fn show(
                     };
                     let deleted =
                         matches!((row_ref, &edit), (RowRef::Existing(r), Some(e)) if e.edits.deletes.contains(&r));
+                    let selected = matches!(row_ref, RowRef::Existing(r) if selection.rows.contains(&r));
                     row.col(|ui| match row_ref {
                         RowRef::Existing(r) => {
-                            ui.weak((r + 1).to_string());
+                            if selected {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, ui.visuals().selection.bg_fill);
+                            }
+                            let num = ui.add(
+                                egui::Label::new(RichText::new((r + 1).to_string()).weak())
+                                    .sense(egui::Sense::click())
+                                    .selectable(false),
+                            );
+                            if num.clicked() {
+                                clicked_row = Some((idx, r));
+                            }
                         }
                         RowRef::New(_) => {
                             ui.label(RichText::new("+").strong().color(Color32::from_rgb(60, 160, 80)));
@@ -167,6 +282,9 @@ pub fn show(
                             };
                             if let Some(color) = tint {
                                 ui.painter().rect_filled(ui.max_rect(), 0.0, color);
+                            } else if selected {
+                                let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.45);
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, fill);
                             }
 
                             if let Some(e) = edit.as_mut()
@@ -215,8 +333,17 @@ pub fn show(
                                 }
                                 resp.on_hover_text("Open the referenced row")
                             } else {
-                                ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+                                ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()).selectable(false))
                             };
+                            if let RowRef::Existing(r) = row_ref {
+                                if response.clicked() && link.is_none() {
+                                    clicked_row = Some((idx, r));
+                                }
+                                if response.secondary_clicked() && !selection.rows.contains(&r) {
+                                    context_row = Some(r);
+                                }
+                            }
+                            let selected_count = selection.rows.len().max(1);
                             if let Some(e) = edit.as_mut()
                                 && response.double_clicked()
                                 && !deleted
@@ -234,6 +361,31 @@ pub fn show(
                                         _ => String::new(),
                                     };
                                     ui.ctx().copy_text(copied);
+                                }
+                                if matches!(row_ref, RowRef::Existing(_)) {
+                                    let label = if selected_count == 1 {
+                                        "Copy row as".to_string()
+                                    } else {
+                                        format!("Copy {selected_count} rows as")
+                                    };
+                                    ui.menu_button(label, |ui| {
+                                        for (name, format) in [
+                                            ("TSV (spreadsheet)", CopyFormat::Tsv),
+                                            ("CSV", CopyFormat::Csv),
+                                            ("JSON", CopyFormat::Json),
+                                            ("Markdown table", CopyFormat::Markdown),
+                                        ] {
+                                            if ui.button(name).clicked() {
+                                                copy_request = Some(format);
+                                            }
+                                        }
+                                        let insert = ui
+                                            .add_enabled(table.is_some(), egui::Button::new("INSERT statements"))
+                                            .on_disabled_hover_text("Rows must come from a single table");
+                                        if insert.clicked() {
+                                            copy_request = Some(CopyFormat::Insert);
+                                        }
+                                    });
                                 }
                                 let Some(e) = edit.as_mut() else { return };
                                 ui.separator();
@@ -269,6 +421,16 @@ pub fn show(
 
     if let Some(col) = clicked_header {
         sort.toggle(col);
+    }
+    if let Some((display, row)) = clicked_row {
+        selection.click(display, row, &sort.order, modifiers);
+    }
+    if let Some(row) = context_row {
+        selection.rows = BTreeSet::from([row]);
+        selection.anchor = sort.order.iter().position(|&r| r == row);
+    }
+    if let Some(format) = copy_request {
+        copy_rows(ui.ctx(), rs, &selection.in_display_order(&sort.order), format, dialect, table);
     }
     clicked_link
 }
