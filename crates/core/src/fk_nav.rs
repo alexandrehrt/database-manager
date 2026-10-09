@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::{Column, ColumnOrigin, Dialect, ForeignKey, Value};
+use crate::{Column, ColumnOrigin, Dialect, ForeignKey, IncomingKey, Value};
 
 /// Foreign keys of the tables a result set reads from, keyed by `(schema, table)`.
 pub type ForeignKeyIndex = HashMap<(String, String), Vec<ForeignKey>>;
@@ -60,4 +60,40 @@ pub fn navigation_query(dialect: Dialect, link: &FkLink) -> (String, Vec<Value>)
         conditions.join(" AND ")
     );
     (sql, link.values.clone())
+}
+
+/// Values of `key`'s referenced columns in `row`, if all are present and non-NULL.
+pub fn referencing_values(columns: &[Column], row: &[Value], key: &IncomingKey) -> Option<Vec<Value>> {
+    let fk = &key.foreign_key;
+    fk.ref_columns
+        .iter()
+        .map(|col| {
+            let wanted =
+                ColumnOrigin { schema: fk.ref_schema.clone(), table: fk.ref_table.clone(), column: col.clone() };
+            let idx = columns.iter().position(|c| c.origin.as_ref() == Some(&wanted))?;
+            row.get(idx).filter(|v| !v.is_null()).cloned()
+        })
+        .collect()
+}
+
+/// `SELECT * FROM <referencing table> WHERE <fk cols> = <values>`, casting
+/// like [`navigation_query`].
+pub fn referencing_query(dialect: Dialect, key: &IncomingKey, values: &[Value]) -> (String, Vec<Value>) {
+    let conditions: Vec<String> = key
+        .foreign_key
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let param = dialect.placeholder(i + 1);
+            let rhs = match (dialect, key.column_types.get(i)) {
+                (Dialect::Postgres, Some(ty)) => format!("CAST({param}::text AS {ty})"),
+                _ => param,
+            };
+            format!("{} = {rhs}", dialect.quote_ident(col))
+        })
+        .collect();
+    let sql =
+        format!("SELECT * FROM {} WHERE {}", dialect.qualified(&key.schema, &key.table), conditions.join(" AND "));
+    (sql, values.to_vec())
 }

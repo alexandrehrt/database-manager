@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use dbm_core::config::{DataSourceConfig, DataSourceKind};
-use dbm_core::{Connection, DbError, DbResult, Relation, StatementResult, TableDetails, Value};
+use dbm_core::{Connection, DbError, DbResult, IncomingKey, Relation, StatementResult, TableDetails, Value};
 use eframe::egui;
 
 use crate::persist;
@@ -17,6 +17,12 @@ use crate::persist;
 pub type SharedConnection = Arc<dyn Connection>;
 
 pub enum Event {
+    Incoming {
+        source: String,
+        schema: String,
+        table: String,
+        result: DbResult<Vec<IncomingKey>>,
+    },
     Connected {
         source: String,
         result: DbResult<SharedConnection>,
@@ -232,6 +238,13 @@ impl Worker {
             let own_transaction = !conn.in_transaction().await;
             let result = apply_edits(conn.as_ref(), statements, own_transaction).await;
             Event::EditsSubmitted { console, tab, result, in_transaction: conn.in_transaction().await }
+        });
+    }
+
+    pub fn incoming(&self, conn: SharedConnection, source: String, schema: String, table: String) {
+        self.spawn(async move {
+            let result = conn.referencing_keys(&schema, &table).await;
+            Event::Incoming { source, schema, table, result }
         });
     }
 

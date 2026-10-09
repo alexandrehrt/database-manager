@@ -85,6 +85,8 @@ pub struct App {
     fk_cache: HashMap<String, ForeignKeyIndex>,
     /// Table details per data source, for deciding whether results are editable.
     table_cache: HashMap<String, HashMap<(String, String), TableDetails>>,
+    /// Foreign keys pointing at each table, per data source, for "Referencing rows".
+    incoming_cache: HashMap<String, HashMap<(String, String), Vec<dbm_core::IncomingKey>>>,
     fk_pending: HashSet<(String, String, String)>,
 }
 
@@ -111,6 +113,7 @@ impl App {
             quit_confirmed: false,
             fk_cache: HashMap::new(),
             table_cache: HashMap::new(),
+            incoming_cache: HashMap::new(),
             fk_pending: HashSet::new(),
         }
     }
@@ -227,6 +230,7 @@ impl App {
     fn disconnect_source(&mut self, id: &str) {
         self.fk_cache.remove(id);
         self.table_cache.remove(id);
+        self.incoming_cache.remove(id);
         self.worker.disconnect(id);
         self.trees.remove(id);
         let consoles: Vec<u64> = self.consoles().filter(|c| c.source == id).map(|c| c.id).collect();
@@ -257,6 +261,7 @@ impl App {
             if cached || !self.fk_pending.insert(key) {
                 continue;
             }
+            self.worker.incoming(conn.clone(), source.to_string(), schema.clone(), table.clone());
             self.worker.details(conn.clone(), source.to_string(), schema, table);
         }
     }
@@ -324,6 +329,12 @@ impl App {
                 }
                 Err(e) => self.fail_pending(console, e),
             },
+            Event::Incoming { source, schema, table, result } => {
+                // On failure the menu simply has no referencing entries for this table.
+                if let Ok(keys) = result {
+                    self.incoming_cache.entry(source).or_default().insert((schema, table), keys);
+                }
+            }
             Event::EditsSubmitted { console, tab, result, in_transaction } => {
                 let mut refresh = None;
                 if let Some(c) = self.console_mut(console) {
@@ -501,6 +512,7 @@ impl App {
             Action::Refresh(id) => {
                 self.fk_cache.remove(&id);
                 self.table_cache.remove(&id);
+                self.incoming_cache.remove(&id);
                 self.tree(&id).schemas = Loadable::NotLoaded;
             }
             Action::LoadSchemas(source) => {
@@ -677,6 +689,7 @@ impl eframe::App for App {
         let mut console_actions = Vec::new();
         let no_fks = ForeignKeyIndex::new();
         let no_tables = HashMap::new();
+        let no_incoming = HashMap::new();
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tabs.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -711,7 +724,8 @@ impl eframe::App for App {
                     let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
                     let fks = self.fk_cache.get(&c.source).unwrap_or(&no_fks);
                     let tables = self.table_cache.get(&c.source).unwrap_or(&no_tables);
-                    if let Some(a) = c.show(ui, history, fks, tables) {
+                    let incoming = self.incoming_cache.get(&c.source).unwrap_or(&no_incoming);
+                    if let Some(a) = c.show(ui, history, fks, tables, incoming) {
                         console_actions.push((c.id, a));
                     }
                 }

@@ -1,6 +1,8 @@
 //! Catalog queries against `pg_catalog`.
 
-use dbm_core::{ColumnInfo, DbError, DbResult, Dialect, ForeignKey, IndexInfo, Relation, RelationKind, TableDetails};
+use dbm_core::{
+    ColumnInfo, DbError, DbResult, Dialect, ForeignKey, IncomingKey, IndexInfo, Relation, RelationKind, TableDetails,
+};
 use tokio_postgres::Client;
 
 use crate::pg_err;
@@ -129,6 +131,44 @@ pub async fn table_details(client: &Client, schema: &str, name: &str) -> DbResul
         .collect();
 
     Ok(TableDetails { schema: schema.to_string(), name: name.to_string(), kind, columns, indexes, foreign_keys })
+}
+
+pub async fn referencing_keys(client: &Client, schema: &str, name: &str) -> DbResult<Vec<IncomingKey>> {
+    let (oid, _) = relation_oid(client, schema, name).await?;
+    let rows = client
+        .query(
+            "SELECT rn.nspname::text, rc.relname::text, con.conname::text, \
+                    ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY k(n, ord) \
+                          JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n ORDER BY k.ord), \
+                    ARRAY(SELECT a.attname::text FROM unnest(con.confkey) WITH ORDINALITY k(n, ord) \
+                          JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n ORDER BY k.ord), \
+                    ARRAY(SELECT format_type(a.atttypid, a.atttypmod) FROM unnest(con.conkey) WITH ORDINALITY k(n, ord) \
+                          JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n ORDER BY k.ord) \
+             FROM pg_constraint con \
+             JOIN pg_class rc ON rc.oid = con.conrelid \
+             JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+             WHERE con.contype = 'f' AND con.confrelid = $1 \
+             ORDER BY rn.nspname, rc.relname, con.conname",
+            &[&oid],
+        )
+        .await
+        .map_err(pg_err)?;
+    Ok(rows
+        .iter()
+        .map(|r| IncomingKey {
+            schema: r.get(0),
+            table: r.get(1),
+            foreign_key: ForeignKey {
+                name: r.get(2),
+                columns: r.get(3),
+                ref_schema: schema.to_string(),
+                ref_table: name.to_string(),
+                ref_columns: r.get(4),
+                ref_column_types: Vec::new(),
+            },
+            column_types: r.get(5),
+        })
+        .collect())
 }
 
 pub async fn ddl(client: &Client, schema: &str, name: &str) -> DbResult<String> {
