@@ -3,6 +3,9 @@
 //! Semicolons inside string literals, quoted identifiers, comments,
 //! Postgres dollar-quoted bodies, SQLite trigger bodies (`BEGIN … END`) and
 //! Postgres `BEGIN ATOMIC … END` function bodies do not end a statement.
+//! For Oracle, PL/SQL blocks (anonymous `BEGIN`/`DECLARE` blocks and
+//! `CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER/TYPE`) run until a line holding
+//! only `/`, which also ends ordinary statements, as in SQL*Plus.
 
 use std::ops::Range;
 
@@ -46,6 +49,28 @@ impl Statement {
         match dialect {
             Dialect::Sqlite => head.iter().take(3).any(|w| *w == "TRIGGER"),
             Dialect::Postgres => matches!(head.get(1), Some(&"FUNCTION") | Some(&"PROCEDURE")),
+            // PL/SQL bodies are handled by `is_plsql`.
+            Dialect::Oracle => false,
+        }
+    }
+
+    /// A PL/SQL block, which only a `/` line (or the end) terminates.
+    fn is_plsql(&self) -> bool {
+        let head: Vec<&str> = self
+            .head
+            .iter()
+            .map(String::as_str)
+            .filter(|w| !matches!(*w, "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE"))
+            .collect();
+        match head.first() {
+            Some(&"BEGIN") | Some(&"DECLARE") => true,
+            Some(&"CREATE") => {
+                matches!(
+                    head.get(1),
+                    Some(&"PROCEDURE") | Some(&"FUNCTION") | Some(&"PACKAGE") | Some(&"TRIGGER") | Some(&"TYPE")
+                )
+            }
+            _ => false,
         }
     }
 
@@ -58,6 +83,7 @@ impl Statement {
             let opens_body = match dialect {
                 Dialect::Sqlite => upper == "BEGIN" && self.block_depth == 0,
                 Dialect::Postgres => upper == "ATOMIC" && self.prev_word == "BEGIN",
+                Dialect::Oracle => false,
             };
             if opens_body || (self.block_depth > 0 && upper == "CASE") {
                 self.block_depth += 1;
@@ -85,7 +111,14 @@ impl Splitter<'_> {
             let start = self.i;
             let b = self.src[self.i];
             match b {
-                b';' if stmt.block_depth == 0 => {
+                b'/' if self.dialect == Dialect::Oracle && self.slash_line() => {
+                    if let Some(s) = stmt.code_start {
+                        spans.push(s..stmt.code_end);
+                    }
+                    stmt = Statement::default();
+                    self.i += 1;
+                }
+                b';' if stmt.block_depth == 0 && !(self.dialect == Dialect::Oracle && stmt.is_plsql()) => {
                     if let Some(s) = stmt.code_start {
                         spans.push(s..stmt.code_end);
                     }
@@ -137,6 +170,14 @@ impl Splitter<'_> {
             spans.push(s..stmt.code_end);
         }
         spans
+    }
+
+    /// Whether the `/` at the cursor is alone on its line.
+    fn slash_line(&self) -> bool {
+        let line_start = self.src[..self.i].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let line_end = self.src[self.i..].iter().position(|&b| b == b'\n').map_or(self.src.len(), |p| self.i + p);
+        self.src[line_start..self.i].iter().all(u8::is_ascii_whitespace)
+            && self.src[self.i + 1..line_end].iter().all(u8::is_ascii_whitespace)
     }
 
     fn skip_line_comment(&mut self) {

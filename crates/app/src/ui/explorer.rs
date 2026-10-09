@@ -213,6 +213,9 @@ pub fn source_description(source: &DataSourceConfig) -> String {
     match &source.kind {
         dbm_core::config::DataSourceKind::Sqlite { .. } => "SQLite · local".into(),
         dbm_core::config::DataSourceKind::Postgres { host, port, .. } => format!("PostgreSQL · {host}:{port}"),
+        dbm_core::config::DataSourceKind::Oracle { host, port, service, .. } => {
+            format!("Oracle · {host}:{port}/{service}")
+        }
     }
 }
 
