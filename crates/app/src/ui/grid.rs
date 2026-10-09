@@ -71,6 +71,8 @@ impl SortState {
 pub struct Selection {
     pub rows: BTreeSet<usize>,
     anchor: Option<usize>,
+    /// Column of the last clicked cell, for the value viewer.
+    pub cell: Option<usize>,
 }
 
 impl Selection {
@@ -133,6 +135,8 @@ pub enum GridEvent {
     Link(usize, usize),
     /// Open the rows of referencing key `key` that point at `row`.
     Referencing { row: usize, key: usize },
+    /// Show column `col` of the selected row in the value viewer.
+    ViewValue(usize),
     /// Header of column `col` clicked while sorting is server-side.
     SortBy(usize),
 }
@@ -245,6 +249,7 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
     }
     let modifiers = ui.input(|i| i.modifiers);
     let mut clicked_row: Option<(usize, usize)> = None;
+    let mut clicked_cell: Option<usize> = None;
     let mut context_row: Option<usize> = None;
     let mut copy_request: Option<CopyFormat> = None;
     let added = edit.as_ref().map_or(0, |e| e.edits.inserts.len());
@@ -463,6 +468,9 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 if whole.clicked() && link.is_none() {
                                     clicked_row = Some((idx, r));
                                 }
+                                if whole.clicked() || response.clicked() || whole.secondary_clicked() {
+                                    clicked_cell = Some(c);
+                                }
                                 if whole.secondary_clicked() && !selection.rows.contains(&r) {
                                     context_row = Some(r);
                                 }
@@ -492,6 +500,9 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                         });
                                         ui.separator();
                                     }
+                                }
+                                if matches!(row_ref, RowRef::Existing(_)) && ui.button("View value").clicked() {
+                                    event = Some(GridEvent::ViewValue(c));
                                 }
                                 if ui.button("Copy value").clicked() {
                                     let copied = match &value {
@@ -563,6 +574,9 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
         } else {
             sort.toggle(col);
         }
+    }
+    if clicked_cell.is_some() {
+        selection.cell = clicked_cell;
     }
     if let Some((display, row)) = clicked_row {
         selection.click(display, row, &sort.order, modifiers);

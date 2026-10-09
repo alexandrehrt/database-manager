@@ -225,6 +225,10 @@ pub struct Console {
     editor_collapsed: bool,
     panel_open: bool,
     panel: Option<RowPanel>,
+    /// Column shown in the row panel's value viewer, instead of all fields.
+    value_col: Option<usize>,
+    /// Text of the value viewer, for the (tab, row, column) it was filled from.
+    value_buffer: Option<((usize, usize, usize), String)>,
     /// The statements "View SQL" shows.
     view_sql: Option<String>,
     /// An action waiting for the user to discard pending grid edits.
@@ -288,6 +292,8 @@ impl Console {
             editor_collapsed: false,
             panel_open: true,
             panel: None,
+            value_col: None,
+            value_buffer: None,
             view_sql: None,
             guard: None,
             statement_rect: None,
@@ -1142,7 +1148,14 @@ impl Console {
         };
         let mut sort_request = None;
         let mut action = None;
-        match grid::show(ui, rs, &mut tab.sort, opts) {
+        let event = grid::show(ui, rs, &mut tab.sort, opts);
+        // The open value viewer follows the clicked cell.
+        if self.value_col.is_some()
+            && let Some(c) = tab.selection.cell
+        {
+            self.value_col = Some(c);
+        }
+        match event {
             Some(_) if running => {}
             Some(GridEvent::Link(row, col)) => {
                 if let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks) {
@@ -1150,6 +1163,10 @@ impl Console {
                 }
             }
             Some(GridEvent::SortBy(col)) => sort_request = Some((col, rs.columns[col].name.clone())),
+            Some(GridEvent::ViewValue(col)) => {
+                self.value_col = Some(col);
+                self.panel_open = true;
+            }
             Some(GridEvent::Referencing { row, key }) => {
                 if let Some(k) = keys.get(key)
                     && let Some(values) = referencing_values(&rs.columns, &rs.rows[row], k)
@@ -1476,6 +1493,10 @@ impl Console {
             None => format!("Row {}", row + 1),
         };
         let mut close = false;
+        let mut back = false;
+        let value_col = self.value_col.filter(|&c| c < rs.columns.len());
+        let value_buffer = &mut self.value_buffer;
+        let mut open_value = None;
         egui::Panel::right(egui::Id::new(("row-panel", self.id)))
             .resizable(true)
             .default_size(270.0)
@@ -1496,6 +1517,98 @@ impl Console {
                     });
                 });
                 ui.add_space(6.0);
+                if let Some(c) = value_col {
+                    let m = &meta[c];
+                    let value = current(c, &tab.edits);
+                    let original = &rs.rows[row][c];
+                    let changed = tab.edits.updates.contains_key(&(row, c));
+                    let json =
+                        matches!(original, Value::Json(_)) || rs.columns[c].type_name.to_lowercase().contains("json");
+                    let binary = matches!(original, Value::Bytes(_) | Value::Array(_));
+                    let can_edit = editable && !deleted && !m.primary_key && !binary;
+                    let key = (idx, row, c);
+                    if value_buffer.as_ref().is_none_or(|(k, _)| *k != key) {
+                        *value_buffer = Some((key, value_text(&value)));
+                    }
+                    let Some((_, buffer)) = value_buffer.as_mut() else { return };
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::flat_button(icon::ARROW_LEFT)).on_hover_text("All fields").clicked() {
+                            back = true;
+                        }
+                        ui.label(RichText::new(&rs.columns[c].name).font(theme::font(13.0, theme::medium())));
+                        ui.label(RichText::new(rs.columns[c].type_name.to_lowercase()).small().color(color::TEXT_WEAK));
+                        if value.is_null() {
+                            theme::pill(ui, RichText::new("NULL").size(10.0).color(color::TEXT_WEAK), color::BG_SUNKEN);
+                        }
+                        if changed {
+                            ui.label(RichText::new("changed").small().color(color::WARNING));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::flat_button(format!("{}  Copy", icon::COPY))).clicked() {
+                            ui.ctx().copy_text(buffer.clone());
+                        }
+                        if can_edit && ui.add(theme::flat_button("Set NULL")).clicked() {
+                            buffer.clear();
+                            tab.edits.set(rs, RowRef::Existing(row), c, Value::Null);
+                        }
+                        if json
+                            && can_edit
+                            && let Ok(v) = serde_json::from_str::<serde_json::Value>(buffer)
+                            && ui.add(theme::flat_button("Format")).clicked()
+                        {
+                            *buffer = serde_json::to_string_pretty(&v).unwrap_or_default();
+                            tab.edits.set(rs, RowRef::Existing(row), c, Value::Text(buffer.clone()));
+                        }
+                        if changed && ui.add(theme::flat_button("Revert")).clicked() {
+                            tab.edits.updates.remove(&(row, c));
+                            *buffer = value_text(original);
+                        }
+                    });
+                    if json
+                        && !buffer.is_empty()
+                        && let Err(e) = serde_json::from_str::<serde_json::Value>(buffer)
+                    {
+                        ui.label(RichText::new(format!("Invalid JSON: {e}")).small().color(color::DANGER));
+                    }
+                    ui.add_space(4.0);
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+                        let job = if json {
+                            sql_highlight::json_layout(ui, text.as_str(), wrap)
+                        } else {
+                            let mut job = egui::text::LayoutJob::simple(
+                                text.as_str().to_owned(),
+                                theme::mono(12.5),
+                                ui.visuals().text_color(),
+                                wrap,
+                            );
+                            job.wrap.max_width = wrap;
+                            job
+                        };
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        let mut edit = |text: &mut dyn egui::TextBuffer, ui: &mut egui::Ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(text)
+                                    .font(theme::mono(12.5))
+                                    .hint_text(if value.is_null() { "NULL" } else { "" })
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(12)
+                                    .layouter(&mut layouter),
+                            )
+                        };
+                        if can_edit {
+                            if edit(buffer, ui).changed() {
+                                tab.edits.set(rs, RowRef::Existing(row), c, Value::Text(buffer.clone()));
+                            }
+                        } else {
+                            // Read-only values stay selectable through an immutable buffer.
+                            edit(&mut buffer.as_str(), ui);
+                        }
+                    });
+                    return;
+                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for (c, col) in rs.columns.iter().enumerate() {
                         let m = &meta[c];
@@ -1521,6 +1634,13 @@ impl Console {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&col.name).color(color::TEXT));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add(theme::flat_button(RichText::new(icon::ARROWS_OUT_SIMPLE).size(11.0)))
+                                    .on_hover_text("Open in the value viewer")
+                                    .clicked()
+                                {
+                                    open_value = Some(c);
+                                }
                                 let detail = if changed {
                                     RichText::new("changed").small().color(color::WARNING)
                                 } else {
@@ -1603,6 +1723,17 @@ impl Console {
         if close {
             self.panel_open = false;
             self.panel = None;
+            self.value_col = None;
+        }
+        if back {
+            // Field buffers are rebuilt from the edits made in the viewer.
+            self.value_col = None;
+            self.panel = None;
+        }
+        if let Some(c) = open_value {
+            self.value_col = Some(c);
+            self.value_buffer = None;
+            self.results[idx].selection.cell = Some(c);
         }
         action
     }
@@ -1863,5 +1994,25 @@ fn export(rs: &ResultSet, format: &str) {
             .set_description(e)
             .set_level(rfd::MessageLevel::Error)
             .show();
+    }
+}
+
+/// A value as the value viewer shows it: JSON pretty-printed, bytes as a hex dump.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Json(j) => serde_json::to_string_pretty(j).unwrap_or_else(|_| j.to_string()),
+        Value::Bytes(b) => b
+            .chunks(16)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+                let ascii: String =
+                    chunk.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }).collect();
+                format!("{:08x}  {:<47}  {ascii}", i * 16, hex.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        v => v.to_string(),
     }
 }
