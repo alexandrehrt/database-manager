@@ -9,7 +9,7 @@ use dbm_core::fk_nav::ForeignKeyIndex;
 use eframe::egui;
 
 use crate::persist;
-use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement};
+use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TxMode};
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
 use crate::ui::explorer::{self, ConnStatus, Loadable, RelationNode, SchemaNode, SourceTree};
 use crate::worker::{Event, Worker};
@@ -52,10 +52,16 @@ impl Tab {
 
 /// A run requested before its data source finished connecting.
 struct PendingRun {
-    console: u64,
     statements: Vec<Statement>,
     limit: usize,
     mode: RunMode,
+}
+
+/// An action held back because it would discard an open transaction.
+enum Confirm {
+    CloseConsole(u64),
+    Disconnect(String),
+    Quit,
 }
 
 pub struct App {
@@ -71,7 +77,10 @@ pub struct App {
     active_tab: usize,
     next_id: u64,
     history: HashMap<String, Vec<String>>,
-    pending_runs: HashMap<String, Vec<PendingRun>>,
+    /// Runs waiting for their console's connection, by console id.
+    pending_runs: HashMap<u64, Vec<PendingRun>>,
+    confirm: Option<Confirm>,
+    quit_confirmed: bool,
     /// Foreign keys per data source, filled from table details as results need them.
     fk_cache: HashMap<String, ForeignKeyIndex>,
     fk_pending: HashSet<(String, String, String)>,
@@ -96,6 +105,8 @@ impl App {
             next_id: 1,
             history: persist::load_history(),
             pending_runs: HashMap::new(),
+            confirm: None,
+            quit_confirmed: false,
             fk_cache: HashMap::new(),
             fk_pending: HashSet::new(),
         }
@@ -143,15 +154,21 @@ impl App {
 
     /// Starts a run, connecting first if needed.
     fn start_run(&mut self, console_id: u64, statements: Vec<Statement>, limit: usize, mode: RunMode) {
-        let Some(source) = self.console_mut(console_id).map(|c| c.source.clone()) else { return };
-        let Some(conn) = self.worker.connection(&source) else {
-            self.pending_runs.entry(source.clone()).or_default().push(PendingRun {
-                console: console_id,
-                statements,
-                limit,
-                mode,
-            });
-            if self.tree(&source).status != ConnStatus::Connecting {
+        let Some((source, tx_mode)) = self.console_mut(console_id).map(|c| (c.source.clone(), c.tx_mode)) else {
+            return;
+        };
+        let Some(conn) = self.worker.console_connection(console_id) else {
+            let pending = self.pending_runs.entry(console_id).or_default();
+            let first = pending.is_empty();
+            pending.push(PendingRun { statements, limit, mode });
+            if first && let Some(config) = self.source(&source).cloned() {
+                let password = self.session_passwords.get(&source).cloned();
+                self.worker.connect_console(console_id, config, password);
+            }
+            // The explorer connection serves metadata, such as foreign keys for links.
+            if self.worker.connection(&source).is_none()
+                && !matches!(self.tree(&source).status, ConnStatus::Connecting | ConnStatus::Connected)
+            {
                 self.apply(Action::Connect(source));
             }
             return;
@@ -159,6 +176,7 @@ impl App {
         let run_id = self.next_id();
         let stop = Arc::new(AtomicBool::new(false));
         let Some(console) = self.console_mut(console_id) else { return };
+        console.tx_notice = None;
         if matches!(mode, RunMode::Fresh) {
             console.results.clear();
             console.active_result = 0;
@@ -174,11 +192,62 @@ impl App {
             mode,
             params: statements.iter().map(|(_, p)| p.clone()).collect(),
         });
-        self.worker.run_statements(conn, console_id, run_id, statements, limit, stop);
+        let begin_first = tx_mode == TxMode::Manual;
+        self.worker.run_statements(conn, console_id, run_id, statements, limit, stop, begin_first);
+    }
+
+    /// Shows a connection failure in the console whose runs were waiting for it.
+    fn fail_pending(&mut self, console_id: u64, error: dbm_core::DbError) {
+        let pending = self.pending_runs.remove(&console_id).unwrap_or_default();
+        if let Some(c) = self.console_mut(console_id) {
+            c.results = pending
+                .into_iter()
+                .map(|p| ResultTab {
+                    title: None,
+                    sql: p.statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(";\n"),
+                    params: Vec::new(),
+                    outcome: Err(error.clone()),
+                    elapsed: Default::default(),
+                    limit: p.limit,
+                    sort: Default::default(),
+                })
+                .collect();
+            c.active_result = 0;
+        }
+    }
+
+    fn consoles(&self) -> impl Iterator<Item = &Console> {
+        self.tabs.iter().filter_map(|t| match t {
+            Tab::Console(c) => Some(c.as_ref()),
+            _ => None,
+        })
+    }
+
+    /// Closes the explorer connection and every console connection of a source;
+    /// the server rolls back their open transactions.
+    fn disconnect_source(&mut self, id: &str) {
+        self.fk_cache.remove(id);
+        self.worker.disconnect(id);
+        self.trees.remove(id);
+        let consoles: Vec<u64> = self.consoles().filter(|c| c.source == id).map(|c| c.id).collect();
+        for console in consoles {
+            self.worker.close_console(console);
+            self.pending_runs.remove(&console);
+            if let Some(c) = self.console_mut(console) {
+                if c.in_transaction {
+                    c.tx_notice = Some(Err("Disconnected: the open transaction was rolled back".into()));
+                }
+                c.in_transaction = false;
+            }
+        }
     }
 
     /// Requests foreign keys for every table a result set read from.
-    fn load_foreign_keys(&mut self, source: &str, rs: &dbm_core::ResultSet) {
+    fn load_foreign_keys(&mut self, source: &str, console: u64, rs: &dbm_core::ResultSet) {
+        // Prefer the explorer connection; a console in an aborted transaction can't run catalog queries.
+        let Some(conn) = self.worker.connection(source).or_else(|| self.worker.console_connection(console)) else {
+            return;
+        };
         let tables: HashSet<(String, String)> =
             rs.columns.iter().filter_map(|c| c.origin.as_ref()).map(|o| (o.schema.clone(), o.table.clone())).collect();
         for (schema, table) in tables {
@@ -188,7 +257,7 @@ impl App {
             if cached || !self.fk_pending.insert(key) {
                 continue;
             }
-            self.apply(Action::LoadDetails(source.to_string(), schema, table));
+            self.worker.details(conn.clone(), source.to_string(), schema, table);
         }
     }
 
@@ -196,13 +265,25 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
-        if let Tab::Console(c) = &self.tabs[i]
-            && let Some(run) = &c.run
-        {
-            run.stop.store(true, Ordering::Relaxed);
+        if let Tab::Console(c) = &self.tabs[i] {
+            if let Some(run) = &c.run {
+                run.stop.store(true, Ordering::Relaxed);
+            }
+            let id = c.id;
+            self.worker.close_console(id);
+            self.pending_runs.remove(&id);
         }
         self.tabs.remove(i);
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Closes tab `i`, first asking if its console has an open transaction.
+    fn request_close_tab(&mut self, i: usize) {
+        match self.tabs.get(i) {
+            Some(Tab::Console(c)) if c.in_transaction => self.confirm = Some(Confirm::CloseConsole(c.id)),
+            Some(_) => self.close_tab(i),
+            None => {}
+        }
     }
 
     /// The data source a new console should use: the active console's, else the first one.
@@ -228,30 +309,33 @@ impl App {
                     let tree = self.tree(&source);
                     tree.status = ConnStatus::Connected;
                     tree.schemas = Loadable::NotLoaded;
-                    for p in self.pending_runs.remove(&source).unwrap_or_default() {
-                        self.start_run(p.console, p.statements, p.limit, p.mode);
-                    }
                 }
-                Err(e) => {
-                    self.tree(&source).status = ConnStatus::Failed(e.to_string());
-                    // Pending runs report the connection error in their consoles.
-                    for p in self.pending_runs.remove(&source).unwrap_or_default() {
-                        if let Some(c) = self.console_mut(p.console) {
-                            c.results = vec![ResultTab {
-                                title: None,
-                                sql: p.statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(";\n"),
-                                params: Vec::new(),
-                                outcome: Err(e.clone()),
-                                elapsed: Default::default(),
-                                limit: p.limit,
-                                sort: Default::default(),
-                            }];
-                            c.active_result = 0;
-                        }
-                    }
-                }
+                Err(e) => self.tree(&source).status = ConnStatus::Failed(e.to_string()),
             },
-            Event::StatementDone { console, run, index, result } => {
+            Event::ConsoleConnected { console, result } => match result {
+                Ok(conn) => {
+                    if self.console_mut(console).is_none() {
+                        return; // closed while connecting
+                    }
+                    self.worker.register_console(console, conn);
+                    for p in self.pending_runs.remove(&console).unwrap_or_default() {
+                        self.start_run(console, p.statements, p.limit, p.mode);
+                    }
+                }
+                Err(e) => self.fail_pending(console, e),
+            },
+            Event::ControlDone { console, sql, result, in_transaction } => {
+                if let Some(c) = self.console_mut(console) {
+                    c.tx_busy = false;
+                    c.in_transaction = in_transaction;
+                    c.tx_notice = Some(match result {
+                        Ok(()) if sql == "COMMIT" => Ok("Committed".into()),
+                        Ok(()) => Ok("Rolled back".into()),
+                        Err(e) => Err(format!("{sql} failed: {}", e.message)),
+                    });
+                }
+            }
+            Event::StatementDone { console, run, index, result, in_transaction } => {
                 let rows = match &result.outcome {
                     Ok(ExecOutcome::Rows(rs)) => Some(rs.clone()),
                     _ => None,
@@ -262,6 +346,7 @@ impl App {
                     && r.id == run
                 {
                     r.done = index + 1;
+                    c.in_transaction = in_transaction;
                     let mode = r.mode.clone();
                     let tab = ResultTab {
                         title: None,
@@ -296,15 +381,16 @@ impl App {
                 if let Some(source) = source {
                     self.remember(&source, &result.sql);
                     if let Some(rs) = rows {
-                        self.load_foreign_keys(&source, &rs);
+                        self.load_foreign_keys(&source, console, &rs);
                     }
                 }
             }
-            Event::RunFinished { console, run } => {
+            Event::RunFinished { console, run, in_transaction } => {
                 if let Some(c) = self.console_mut(console)
                     && c.run.as_ref().is_some_and(|r| r.id == run)
                 {
                     c.run = None;
+                    c.in_transaction = in_transaction;
                 }
                 if let Err(e) = persist::save_history(&self.history) {
                     self.status = Some(format!("Could not save query history: {e:#}"));
@@ -389,9 +475,11 @@ impl App {
                 }
             }
             Action::Disconnect(id) => {
-                self.fk_cache.remove(&id);
-                self.worker.disconnect(&id);
-                self.trees.remove(&id);
+                if self.consoles().any(|c| c.source == id && c.in_transaction) {
+                    self.confirm = Some(Confirm::Disconnect(id));
+                } else {
+                    self.disconnect_source(&id);
+                }
             }
             Action::Refresh(id) => {
                 self.fk_cache.remove(&id);
@@ -471,8 +559,7 @@ impl App {
                 }
                 self.persist_sources();
                 // Settings may have changed, so the next expand reconnects.
-                self.worker.disconnect(&id);
-                self.trees.remove(&id);
+                self.disconnect_source(&id);
                 self.dialog = None;
             }
             DialogAction::Delete(id) => {
@@ -480,8 +567,7 @@ impl App {
                 self.persist_sources();
                 persist::delete_password(&id);
                 self.session_passwords.remove(&id);
-                self.worker.disconnect(&id);
-                self.trees.remove(&id);
+                self.disconnect_source(&id);
                 self.dialog = None;
             }
         }
@@ -498,7 +584,14 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut actions = Vec::new();
         let mut close_active = false;
-        if self.dialog.is_none() {
+        if ui.ctx().input(|i| i.viewport().close_requested())
+            && !self.quit_confirmed
+            && self.consoles().any(|c| c.in_transaction)
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Quit);
+        }
+        if self.dialog.is_none() && self.confirm.is_none() {
             ui.input_mut(|i| {
                 if i.consume_shortcut(&NEW_SOURCE) {
                     actions.push(Action::NewSource);
@@ -577,7 +670,9 @@ impl eframe::App for App {
                 for (i, tab) in self.tabs.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        if ui.selectable_label(self.active_tab == i, tab.title()).clicked() {
+                        let in_tx = matches!(tab, Tab::Console(c) if c.in_transaction);
+                        let title = if in_tx { format!("{} (tx)", tab.title()) } else { tab.title().to_string() };
+                        if ui.selectable_label(self.active_tab == i, title).clicked() {
                             self.active_tab = i;
                         }
                         if ui.small_button("x").on_hover_text("Close tab").clicked() {
@@ -588,7 +683,7 @@ impl eframe::App for App {
             });
             ui.separator();
             if let Some(i) = close {
-                self.close_tab(i);
+                self.request_close_tab(i);
                 return;
             }
             let active = self.active_tab.min(self.tabs.len() - 1);
@@ -604,7 +699,7 @@ impl eframe::App for App {
             }
         });
         if close_active {
-            self.close_tab(self.active_tab);
+            self.request_close_tab(self.active_tab);
         }
         for (console, action) in console_actions {
             match action {
@@ -614,14 +709,25 @@ impl eframe::App for App {
                         && let Some(run) = &c.run
                     {
                         run.stop.store(true, Ordering::Relaxed);
-                        let source = c.source.clone();
-                        if let Some(conn) = self.worker.connection(&source) {
+                        if let Some(conn) = self.worker.console_connection(console) {
                             self.worker.cancel(conn);
                         }
                     }
                 }
+                ConsoleAction::Commit | ConsoleAction::Rollback => {
+                    let sql = if matches!(action, ConsoleAction::Commit) { "COMMIT" } else { "ROLLBACK" };
+                    if let Some(conn) = self.worker.console_connection(console)
+                        && let Some(c) = self.console_mut(console)
+                    {
+                        c.tx_busy = true;
+                        c.tx_notice = None;
+                        self.worker.control(conn, console, sql);
+                    }
+                }
             }
         }
+
+        self.confirm_ui(&ui.ctx().clone());
 
         if let Some(dialog) = &mut self.dialog
             && let Some(action) = dialog.show(ui.ctx())
@@ -631,6 +737,60 @@ impl eframe::App for App {
 
         for action in actions {
             self.apply(action);
+        }
+    }
+}
+
+impl App {
+    fn confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &self.confirm else { return };
+        let (message, proceed) = match confirm {
+            Confirm::CloseConsole(_) => {
+                ("This console has an open transaction. Closing it rolls the transaction back.", "Roll back and close")
+            }
+            Confirm::Disconnect(_) => (
+                "A console on this data source has an open transaction. Disconnecting rolls it back.",
+                "Roll back and disconnect",
+            ),
+            Confirm::Quit => ("A console has an open transaction. Quitting rolls it back.", "Roll back and quit"),
+        };
+        let mut decision = None;
+        let modal = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Uncommitted changes");
+            ui.add_space(6.0);
+            ui.label(message);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(proceed).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        });
+        if modal.should_close() && decision.is_none() {
+            decision = Some(false);
+        }
+        let Some(proceed) = decision else { return };
+        let Some(confirm) = self.confirm.take() else { return };
+        if !proceed {
+            return;
+        }
+        match confirm {
+            Confirm::CloseConsole(id) => {
+                if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Console(c) if c.id == id)) {
+                    self.close_tab(i);
+                }
+            }
+            Confirm::Disconnect(id) => self.disconnect_source(&id),
+            Confirm::Quit => {
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 }

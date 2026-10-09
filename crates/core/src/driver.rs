@@ -26,6 +26,9 @@ pub trait Connection: Send + Sync {
     async fn ddl(&self, schema: &str, name: &str) -> DbResult<String>;
 
     fn canceller(&self) -> Arc<dyn Canceller>;
+
+    /// Whether an explicit transaction is open on this connection.
+    async fn in_transaction(&self) -> bool;
 }
 
 #[async_trait]

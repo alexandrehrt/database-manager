@@ -1,9 +1,10 @@
 //! PostgreSQL implementation of [`dbm_core::Connection`] on tokio-postgres.
 //!
-//! Row-returning reads run through a portal inside a short transaction so
-//! that only `max_rows + 1` rows are transferred. When the user has opened
-//! their own transaction (tracked from the statements they run), reads are
-//! fetched in full instead, since our BEGIN/COMMIT would end theirs.
+//! Row-returning reads run through a portal so that only `max_rows + 1` rows
+//! are transferred. Portals need a transaction: outside a user transaction
+//! the read gets a short one of its own; inside one (tracked from the
+//! statements the user runs) the portal runs in the user's transaction,
+//! which is left open.
 
 mod decode;
 mod introspect;
@@ -162,14 +163,28 @@ impl PgConnection {
             return Ok(ExecOutcome::Affected(affected));
         }
 
-        let limit = max_rows.filter(|_| is_read_only_query(sql) && !session.in_user_transaction);
+        let limit = max_rows.filter(|_| is_read_only_query(sql));
+        let in_user_transaction = session.in_user_transaction;
         let (rows, truncated) = match limit {
             Some(max) => {
+                // Inside the user's transaction this BEGIN only draws a
+                // "transaction already in progress" warning.
                 let tx = session.client.transaction().await.map_err(pg_err)?;
-                let portal = tx.bind(&stmt, &param_refs).await.map_err(pg_err)?;
                 let fetch = i32::try_from(max.saturating_add(1)).unwrap_or(i32::MAX);
-                let mut rows = tx.query_portal(&portal, fetch).await.map_err(pg_err)?;
-                tx.commit().await.map_err(pg_err)?;
+                let fetched = async {
+                    let portal = tx.bind(&stmt, &param_refs).await?;
+                    tx.query_portal(&portal, fetch).await
+                }
+                .await;
+                if in_user_transaction {
+                    // Committing or dropping (which rolls back) would end the
+                    // user's transaction, so skip the wrapper's cleanup on
+                    // success and failure alike.
+                    std::mem::forget(tx);
+                } else if fetched.is_ok() {
+                    tx.commit().await.map_err(pg_err)?;
+                }
+                let mut rows = fetched.map_err(pg_err)?;
                 let truncated = rows.len() > max;
                 rows.truncate(max);
                 (rows, truncated)
@@ -229,6 +244,10 @@ impl Connection for PgConnection {
 
     fn canceller(&self) -> Arc<dyn Canceller> {
         Arc::new(PgCanceller { token: self.cancel.clone(), tls: self.tls.clone() })
+    }
+
+    async fn in_transaction(&self) -> bool {
+        self.session.lock().await.in_user_transaction
     }
 }
 

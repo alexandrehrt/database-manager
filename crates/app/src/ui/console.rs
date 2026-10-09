@@ -54,6 +54,14 @@ pub enum RunMode {
     Navigate { from: usize, title: String },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TxMode {
+    /// Every statement commits on its own unless the user runs BEGIN.
+    Auto,
+    /// The first statement opens a transaction that stays open until Commit or Rollback.
+    Manual,
+}
+
 pub struct Console {
     pub id: u64,
     pub source: String,
@@ -66,11 +74,20 @@ pub struct Console {
     /// Result tabs to return to with Back / Forward.
     pub nav_back: Vec<usize>,
     pub nav_forward: Vec<usize>,
+    pub tx_mode: TxMode,
+    /// Last known state of this console's connection.
+    pub in_transaction: bool,
+    /// A Commit / Rollback is in flight.
+    pub tx_busy: bool,
+    /// Outcome of the last Commit / Rollback, shown in the toolbar.
+    pub tx_notice: Option<Result<String, String>>,
 }
 
 pub enum ConsoleAction {
     Run { statements: Vec<Statement>, limit: usize, mode: RunMode },
     Cancel,
+    Commit,
+    Rollback,
 }
 
 impl Console {
@@ -86,6 +103,10 @@ impl Console {
             run: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
+            tx_mode: TxMode::Auto,
+            in_transaction: false,
+            tx_busy: false,
+            tx_notice: None,
         }
     }
 
@@ -146,6 +167,8 @@ impl Console {
                             }
                         });
                     });
+                    ui.separator();
+                    self.transaction_controls(ui, &mut action);
                     if let Some(run) = &self.run {
                         ui.spinner();
                         ui.weak(format!(
@@ -194,6 +217,40 @@ impl Console {
             }
         });
         action
+    }
+
+    fn transaction_controls(&mut self, ui: &mut egui::Ui, action: &mut Option<ConsoleAction>) {
+        ui.label("Tx:");
+        ui.selectable_value(&mut self.tx_mode, TxMode::Auto, "Auto")
+            .on_hover_text("Each statement commits on its own (unless you run BEGIN)");
+        ui.selectable_value(&mut self.tx_mode, TxMode::Manual, "Manual")
+            .on_hover_text("Statements run in a transaction until you Commit or Roll back");
+        let can_end = self.in_transaction && self.run.is_none() && !self.tx_busy;
+        if ui.add_enabled(can_end, egui::Button::new("Commit")).clicked() {
+            *action = Some(ConsoleAction::Commit);
+        }
+        if ui.add_enabled(can_end, egui::Button::new("Rollback")).clicked() {
+            *action = Some(ConsoleAction::Rollback);
+        }
+        if self.in_transaction {
+            ui.label(
+                RichText::new(" TRANSACTION OPEN ")
+                    .small()
+                    .strong()
+                    .color(egui::Color32::BLACK)
+                    .background_color(egui::Color32::from_rgb(240, 190, 60)),
+            )
+            .on_hover_text("Changes made in this console are not visible to others until you commit");
+        }
+        match &self.tx_notice {
+            Some(Ok(msg)) => {
+                ui.weak(msg);
+            }
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            None => {}
+        }
     }
 
     fn run_all(&self) -> Option<ConsoleAction> {
