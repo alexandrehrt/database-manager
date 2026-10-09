@@ -238,7 +238,7 @@ impl eframe::App for App {
             egui::Panel::bottom("status").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.colored_label(ui.visuals().warn_fg_color, status);
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("Dismiss").clicked() {
                         self.status = None;
                     }
                 });

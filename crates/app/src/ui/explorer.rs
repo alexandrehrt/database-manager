@@ -248,7 +248,7 @@ fn table_details(ui: &mut egui::Ui, d: &TableDetails) {
                     }
                     if let Some(fk) = d.foreign_key_for(&col.name) {
                         badge(ui, "FK", fk_color).on_hover_text(format!(
-                            "→ {}.{} ({})",
+                            "references {}.{} ({})",
                             fk.ref_schema,
                             fk.ref_table,
                             fk.ref_columns.join(", ")
@@ -263,7 +263,7 @@ fn table_details(ui: &mut egui::Ui, d: &TableDetails) {
             .show(ui, |ui| {
                 for fk in &d.foreign_keys {
                     ui.label(format!(
-                        "{} ({}) → {}.{} ({})",
+                        "{} ({}) -> {}.{} ({})",
                         fk.name,
                         fk.columns.join(", "),
                         fk.ref_schema,

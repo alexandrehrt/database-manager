@@ -145,7 +145,7 @@ impl DataSourceDialog {
                     });
                 }
                 Some(TestState::Done(Ok(msg))) => {
-                    ui.colored_label(ui.visuals().widgets.active.fg_stroke.color, format!("✔ {msg}"));
+                    ui.colored_label(ui.visuals().widgets.active.fg_stroke.color, msg.as_str());
                 }
                 Some(TestState::Done(Err(e))) => {
                     ui.colored_label(ui.visuals().error_fg_color, e);
