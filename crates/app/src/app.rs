@@ -1018,16 +1018,18 @@ fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool) -> TabClick {
                     "Unsaved changes"
                 });
             }
-            let x = ui.add(
-                egui::Label::new(RichText::new(icon::X).size(11.0).color(color::TEXT_FAINT))
-                    .sense(egui::Sense::click()),
-            );
-            if x.on_hover_text("Close tab").clicked() {
-                click = TabClick::Close;
-            }
+            // Plain label: the tab's single click area below decides between
+            // closing and activating by where the click landed.
+            ui.label(RichText::new(icon::X).size(11.0).color(color::TEXT_FAINT)).rect
         });
-    if matches!(click, TabClick::None) && frame.response.interact(egui::Sense::click()).clicked() {
-        click = TabClick::Activate;
+    let x_rect = frame.inner.expand(4.0);
+    let response = frame.response.interact(egui::Sense::click());
+    let on_x = response.hover_pos().is_some_and(|p| x_rect.contains(p));
+    if on_x {
+        ui.painter().rect_filled(x_rect, 4.0, Color32::from_black_alpha(14));
+    }
+    if response.clicked() {
+        click = if on_x { TabClick::Close } else { TabClick::Activate };
     }
     click
 }
