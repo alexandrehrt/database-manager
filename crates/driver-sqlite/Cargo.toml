@@ -1,0 +1,6 @@
+[package]
+name = "dbm-driver-sqlite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

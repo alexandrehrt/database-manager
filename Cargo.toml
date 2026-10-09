@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/driver-sqlite", "crates/driver-postgres", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/alexandrehrt/database-manager"
+
+[workspace.dependencies]
+dbm-core = { path = "crates/core" }
+dbm-driver-sqlite = { path = "crates/driver-sqlite" }
+dbm-driver-postgres = { path = "crates/driver-postgres" }
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

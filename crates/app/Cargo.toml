@@ -1,0 +1,6 @@
+[package]
+name = "database-manager"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

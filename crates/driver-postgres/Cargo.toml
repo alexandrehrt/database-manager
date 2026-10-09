@@ -1,0 +1,6 @@
+[package]
+name = "dbm-driver-postgres"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
