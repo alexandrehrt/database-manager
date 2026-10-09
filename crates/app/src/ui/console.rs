@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use dbm_core::driver::is_read_only_query;
 use dbm_core::statement_at::statement_at;
-use dbm_core::{DbError, Dialect, ExecOutcome, sql_split};
+use dbm_core::fk_nav::{FkLink, ForeignKeyIndex, link_for_cell};
+use dbm_core::{DbError, Dialect, ExecOutcome, Value, sql_split};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::ui::grid::{self, SortState};
@@ -18,8 +19,14 @@ pub const PAGE_SIZE: usize = 500;
 const RUN_STATEMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const RUN_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Enter);
 
+/// SQL plus its bound parameters.
+pub type Statement = (String, Vec<Value>);
+
 pub struct ResultTab {
+    /// Label for tabs opened by FK navigation; others are numbered.
+    pub title: Option<String>,
     pub sql: String,
+    pub params: Vec<Value>,
     pub outcome: Result<ExecOutcome, DbError>,
     pub elapsed: Duration,
     /// Row limit the statement ran with; "load more" re-runs it with a larger one.
@@ -33,8 +40,18 @@ pub struct Run {
     pub started: Instant,
     pub total: usize,
     pub done: usize,
-    /// Set when the run re-executes one existing tab ("load more").
-    pub replace: Option<usize>,
+    pub mode: RunMode,
+    pub params: Vec<Vec<Value>>,
+}
+
+#[derive(Clone)]
+pub enum RunMode {
+    /// Replace all results.
+    Fresh,
+    /// Re-execute one existing tab ("load more").
+    Replace(usize),
+    /// FK navigation from tab `from`: add a tab and make it current.
+    Navigate { from: usize, title: String },
 }
 
 pub struct Console {
@@ -46,19 +63,35 @@ pub struct Console {
     pub results: Vec<ResultTab>,
     pub active_result: usize,
     pub run: Option<Run>,
+    /// Result tabs to return to with Back / Forward.
+    pub nav_back: Vec<usize>,
+    pub nav_forward: Vec<usize>,
 }
 
 pub enum ConsoleAction {
-    Run { statements: Vec<String>, limit: usize, replace: Option<usize> },
+    Run { statements: Vec<Statement>, limit: usize, mode: RunMode },
     Cancel,
 }
 
 impl Console {
     pub fn new(id: u64, source: String, title: String, dialect: Dialect, sql: String) -> Self {
-        Self { id, source, title, dialect, sql, results: Vec::new(), active_result: 0, run: None }
+        Self {
+            id,
+            source,
+            title,
+            dialect,
+            sql,
+            results: Vec::new(),
+            active_result: 0,
+            run: None,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+        }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, history: &[String]) -> Option<ConsoleAction> {
+    /// `fks` holds foreign keys of the tables results came from, as far as
+    /// they are loaded; cells covered by one become navigation links.
+    pub fn show(&mut self, ui: &mut egui::Ui, history: &[String], fks: &ForeignKeyIndex) -> Option<ConsoleAction> {
         let mut action = None;
         let editor_id = egui::Id::new(("console-editor", self.id));
         let editor_focused = ui.memory(|m| m.has_focus(editor_id));
@@ -152,7 +185,7 @@ impl Console {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(a) = self.results_ui(ui) {
+            if let Some(a) = self.results_ui(ui, fks) {
                 action = Some(a);
             }
         });
@@ -162,7 +195,7 @@ impl Console {
     fn run_all(&self) -> Option<ConsoleAction> {
         let statements: Vec<String> =
             sql_split::split(&self.sql, self.dialect).into_iter().map(|s| self.sql[s].to_string()).collect();
-        (!statements.is_empty()).then_some(ConsoleAction::Run { statements, limit: PAGE_SIZE, replace: None })
+        run_fresh(statements)
     }
 
     fn run_at_cursor(&self, ui: &egui::Ui, editor_id: egui::Id) -> Option<ConsoleAction> {
@@ -179,10 +212,28 @@ impl Console {
                 statement_at(&self.sql, cursor, self.dialect).map(|s| self.sql[s].to_string()).into_iter().collect()
             }
         };
-        (!statements.is_empty()).then_some(ConsoleAction::Run { statements, limit: PAGE_SIZE, replace: None })
+        run_fresh(statements)
     }
 
-    fn results_ui(&mut self, ui: &mut egui::Ui) -> Option<ConsoleAction> {
+    fn go_back(&mut self) {
+        if let Some(prev) = self.nav_back.pop() {
+            self.nav_forward.push(self.active_result);
+            self.active_result = prev;
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(next) = self.nav_forward.pop() {
+            self.nav_back.push(self.active_result);
+            self.active_result = next;
+        }
+    }
+
+    fn tab_label(&self, i: usize) -> String {
+        self.results[i].title.clone().unwrap_or_else(|| format!("Result {}", i + 1))
+    }
+
+    fn results_ui(&mut self, ui: &mut egui::Ui, fks: &ForeignKeyIndex) -> Option<ConsoleAction> {
         if self.results.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.weak(if self.run.is_some() { "Running…" } else { "Results appear here." });
@@ -194,7 +245,7 @@ impl Console {
             ui.horizontal_wrapped(|ui| {
                 for (i, tab) in self.results.iter().enumerate() {
                     let failed = tab.outcome.is_err();
-                    let mut text = RichText::new(format!("Result {}", i + 1));
+                    let mut text = RichText::new(self.tab_label(i));
                     if failed {
                         text = text.color(ui.visuals().error_fg_color);
                     }
@@ -202,6 +253,24 @@ impl Console {
                         self.active_result = i;
                     }
                 }
+            });
+            ui.separator();
+        }
+        if !self.nav_back.is_empty() || !self.nav_forward.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.nav_back.is_empty(), egui::Button::new("< Back")).clicked() {
+                    self.go_back();
+                }
+                if ui.add_enabled(!self.nav_forward.is_empty(), egui::Button::new("Forward >")).clicked() {
+                    self.go_forward();
+                }
+                let trail: Vec<String> = self
+                    .nav_back
+                    .iter()
+                    .chain(std::iter::once(&self.active_result))
+                    .map(|&i| self.tab_label(i.min(self.results.len() - 1)))
+                    .collect();
+                ui.weak(trail.join("  >  "));
             });
             ui.separator();
         }
@@ -218,9 +287,9 @@ impl Console {
                 if rs.truncated && is_read_only_query(&tab.sql) {
                     if ui.add_enabled(!running, egui::Button::new("Load more")).clicked() {
                         action = Some(ConsoleAction::Run {
-                            statements: vec![tab.sql.clone()],
+                            statements: vec![(tab.sql.clone(), tab.params.clone())],
                             limit: tab.limit + PAGE_SIZE,
-                            replace: Some(idx),
+                            mode: RunMode::Replace(idx),
                         });
                     }
                 } else if rs.truncated {
@@ -253,11 +322,37 @@ impl Console {
         });
         ui.separator();
         if let Ok(ExecOutcome::Rows(rs)) = &tab.outcome {
-            grid::show(ui, (console_id, idx), rs, &mut tab.sort);
+            let is_link = |row: usize, col: usize| link_for_cell(&rs.columns, &rs.rows[row], col, fks).is_some();
+            if let Some((row, col)) = grid::show(ui, (console_id, idx), rs, &mut tab.sort, &is_link)
+                && !running
+                && let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks)
+            {
+                action = Some(navigate(self.dialect, idx, &link));
+            }
         } else {
             ui.add(egui::Label::new(RichText::new(&tab.sql).monospace().weak()).wrap());
         }
         action
+    }
+}
+
+fn run_fresh(statements: Vec<String>) -> Option<ConsoleAction> {
+    (!statements.is_empty()).then(|| ConsoleAction::Run {
+        statements: statements.into_iter().map(|s| (s, Vec::new())).collect(),
+        limit: PAGE_SIZE,
+        mode: RunMode::Fresh,
+    })
+}
+
+fn navigate(dialect: Dialect, from: usize, link: &FkLink) -> ConsoleAction {
+    let (sql, params) = dbm_core::fk_nav::navigation_query(dialect, link);
+    let fk = &link.foreign_key;
+    let key: Vec<String> =
+        fk.ref_columns.iter().zip(&link.values).map(|(c, v)| format!("{c} = {v}")).collect();
+    ConsoleAction::Run {
+        statements: vec![(sql, params)],
+        limit: PAGE_SIZE,
+        mode: RunMode::Navigate { from, title: format!("{} ({})", fk.ref_table, key.join(", ")) },
     }
 }
 

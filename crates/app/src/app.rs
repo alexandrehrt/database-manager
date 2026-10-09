@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use dbm_core::config::DataSourceConfig;
+use dbm_core::fk_nav::ForeignKeyIndex;
+use dbm_core::ExecOutcome;
 use eframe::egui;
 
 use crate::persist;
-use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run};
+use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement};
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
 use crate::ui::explorer::{self, ConnStatus, Loadable, RelationNode, SchemaNode, SourceTree};
 use crate::worker::{Event, Worker};
@@ -31,7 +33,7 @@ pub enum Action {
 const HISTORY_LIMIT: usize = 200;
 
 enum Tab {
-    Console(Console),
+    Console(Box<Console>),
     Ddl { id: u64, title: String, text: Loadable<String> },
 }
 
@@ -47,9 +49,9 @@ impl Tab {
 /// A run requested before its data source finished connecting.
 struct PendingRun {
     console: u64,
-    statements: Vec<String>,
+    statements: Vec<Statement>,
     limit: usize,
-    replace: Option<usize>,
+    mode: RunMode,
 }
 
 pub struct App {
@@ -66,6 +68,9 @@ pub struct App {
     next_id: u64,
     history: HashMap<String, Vec<String>>,
     pending_runs: HashMap<String, Vec<PendingRun>>,
+    /// Foreign keys per data source, filled from table details as results need them.
+    fk_cache: HashMap<String, ForeignKeyIndex>,
+    fk_pending: HashSet<(String, String, String)>,
 }
 
 impl App {
@@ -87,6 +92,8 @@ impl App {
             next_id: 1,
             history: persist::load_history(),
             pending_runs: HashMap::new(),
+            fk_cache: HashMap::new(),
+            fk_pending: HashSet::new(),
         }
     }
 
@@ -111,7 +118,7 @@ impl App {
 
     fn console_mut(&mut self, id: u64) -> Option<&mut Console> {
         self.tabs.iter_mut().find_map(|t| match t {
-            Tab::Console(c) if c.id == id => Some(c),
+            Tab::Console(c) if c.id == id => Some(c.as_mut()),
             _ => None,
         })
     }
@@ -126,19 +133,19 @@ impl App {
         let (dialect, name) = (config.kind.dialect(), config.name.clone());
         let id = self.next_id();
         let title = title.unwrap_or_else(|| format!("console [{name}]"));
-        self.open_tab(Tab::Console(Console::new(id, source.to_string(), title, dialect, sql)));
+        self.open_tab(Tab::Console(Box::new(Console::new(id, source.to_string(), title, dialect, sql))));
         Some(id)
     }
 
     /// Starts a run, connecting first if needed.
-    fn start_run(&mut self, console_id: u64, statements: Vec<String>, limit: usize, replace: Option<usize>) {
+    fn start_run(&mut self, console_id: u64, statements: Vec<Statement>, limit: usize, mode: RunMode) {
         let Some(source) = self.console_mut(console_id).map(|c| c.source.clone()) else { return };
         let Some(conn) = self.worker.connection(&source) else {
             self.pending_runs.entry(source.clone()).or_default().push(PendingRun {
                 console: console_id,
                 statements,
                 limit,
-                replace,
+                mode,
             });
             if self.tree(&source).status != ConnStatus::Connecting {
                 self.apply(Action::Connect(source));
@@ -148,9 +155,11 @@ impl App {
         let run_id = self.next_id();
         let stop = Arc::new(AtomicBool::new(false));
         let Some(console) = self.console_mut(console_id) else { return };
-        if replace.is_none() {
+        if matches!(mode, RunMode::Fresh) {
             console.results.clear();
             console.active_result = 0;
+            console.nav_back.clear();
+            console.nav_forward.clear();
         }
         console.run = Some(Run {
             id: run_id,
@@ -158,9 +167,24 @@ impl App {
             started: Instant::now(),
             total: statements.len(),
             done: 0,
-            replace,
+            mode,
+            params: statements.iter().map(|(_, p)| p.clone()).collect(),
         });
         self.worker.run_statements(conn, console_id, run_id, statements, limit, stop);
+    }
+
+    /// Requests foreign keys for every table a result set read from.
+    fn load_foreign_keys(&mut self, source: &str, rs: &dbm_core::ResultSet) {
+        let tables: HashSet<(String, String)> =
+            rs.columns.iter().filter_map(|c| c.origin.as_ref()).map(|o| (o.schema.clone(), o.table.clone())).collect();
+        for (schema, table) in tables {
+            let cached = self.fk_cache.get(source).is_some_and(|idx| idx.contains_key(&(schema.clone(), table.clone())));
+            let key = (source.to_string(), schema.clone(), table.clone());
+            if cached || !self.fk_pending.insert(key) {
+                continue;
+            }
+            self.apply(Action::LoadDetails(source.to_string(), schema, table));
+        }
     }
 
     fn remember(&mut self, source: &str, sql: &str) {
@@ -179,7 +203,7 @@ impl App {
                     tree.status = ConnStatus::Connected;
                     tree.schemas = Loadable::NotLoaded;
                     for p in self.pending_runs.remove(&source).unwrap_or_default() {
-                        self.start_run(p.console, p.statements, p.limit, p.replace);
+                        self.start_run(p.console, p.statements, p.limit, p.mode);
                     }
                 }
                 Err(e) => {
@@ -188,7 +212,9 @@ impl App {
                     for p in self.pending_runs.remove(&source).unwrap_or_default() {
                         if let Some(c) = self.console_mut(p.console) {
                             c.results = vec![ResultTab {
-                                sql: p.statements.join(";\n"),
+                                title: None,
+                                sql: p.statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(";\n"),
+                                params: Vec::new(),
                                 outcome: Err(e.clone()),
                                 elapsed: Default::default(),
                                 limit: p.limit,
@@ -200,29 +226,41 @@ impl App {
                 }
             },
             Event::StatementDone { console, run, index, result } => {
+                let rows = match &result.outcome {
+                    Ok(ExecOutcome::Rows(rs)) => Some(rs.clone()),
+                    _ => None,
+                };
                 let mut source = None;
                 if let Some(c) = self.console_mut(console)
                     && let Some(r) = &mut c.run
                     && r.id == run
                 {
                     r.done = index + 1;
-                    let replace = r.replace;
+                    let mode = r.mode.clone();
                     let tab = ResultTab {
+                        title: None,
                         sql: result.sql.clone(),
+                        params: r.params.get(index).cloned().unwrap_or_default(),
                         outcome: result.outcome,
                         elapsed: result.elapsed,
-                        limit: 0,
+                        limit: PAGE_SIZE,
                         sort: Default::default(),
                     };
-                    match replace {
-                        Some(i) if i < c.results.len() => {
-                            let limit = c.results[i].limit + PAGE_SIZE;
-                            let sort_column = c.results[i].sort.column;
-                            c.results[i] = ResultTab { limit, ..tab };
+                    match mode {
+                        RunMode::Replace(i) if i < c.results.len() => {
+                            let old = &c.results[i];
+                            let (limit, title, sort_column) = (old.limit + PAGE_SIZE, old.title.clone(), old.sort.column);
+                            c.results[i] = ResultTab { limit, title, ..tab };
                             c.results[i].sort.column = sort_column;
                         }
+                        RunMode::Navigate { from, title } => {
+                            c.results.push(ResultTab { title: Some(title), ..tab });
+                            c.nav_back.push(from);
+                            c.nav_forward.clear();
+                            c.active_result = c.results.len() - 1;
+                        }
                         _ => {
-                            c.results.push(ResultTab { limit: PAGE_SIZE, ..tab });
+                            c.results.push(tab);
                             c.active_result = c.results.len() - 1;
                         }
                     }
@@ -230,6 +268,9 @@ impl App {
                 }
                 if let Some(source) = source {
                     self.remember(&source, &result.sql);
+                    if let Some(rs) = rows {
+                        self.load_foreign_keys(&source, &rs);
+                    }
                 }
             }
             Event::RunFinished { console, run } => {
@@ -284,6 +325,13 @@ impl App {
                 }
             }
             Event::Details { source, schema, table, result } => {
+                self.fk_pending.remove(&(source.clone(), schema.clone(), table.clone()));
+                if let Ok(d) = &result {
+                    self.fk_cache
+                        .entry(source.clone())
+                        .or_default()
+                        .insert((schema.clone(), table.clone()), d.foreign_keys.clone());
+                }
                 if let Loadable::Loaded(schemas) = &mut self.tree(&source).schemas
                     && let Some(node) = schemas.iter_mut().find(|s| s.name == schema)
                     && let Loadable::Loaded(rels) = &mut node.relations
@@ -314,10 +362,12 @@ impl App {
                 }
             }
             Action::Disconnect(id) => {
+                self.fk_cache.remove(&id);
                 self.worker.disconnect(&id);
                 self.trees.remove(&id);
             }
             Action::Refresh(id) => {
+                self.fk_cache.remove(&id);
                 self.tree(&id).schemas = Loadable::NotLoaded;
             }
             Action::LoadSchemas(source) => {
@@ -340,7 +390,7 @@ impl App {
                 let Some(dialect) = self.source(&source).map(|s| s.kind.dialect()) else { return };
                 let sql = dialect.select_all(&schema, &table);
                 if let Some(id) = self.new_console(&source, Some(table), sql.clone()) {
-                    self.start_run(id, vec![sql], PAGE_SIZE, None);
+                    self.start_run(id, vec![(sql, Vec::new())], PAGE_SIZE, RunMode::Fresh);
                 }
             }
             Action::ShowDdl { source, schema, table } => {
@@ -447,6 +497,7 @@ impl eframe::App for App {
         });
 
         let mut console_actions = Vec::new();
+        let no_fks = ForeignKeyIndex::new();
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tabs.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -483,7 +534,8 @@ impl eframe::App for App {
             match &mut self.tabs[active] {
                 Tab::Console(c) => {
                     let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
-                    if let Some(a) = c.show(ui, history) {
+                    let fks = self.fk_cache.get(&c.source).unwrap_or(&no_fks);
+                    if let Some(a) = c.show(ui, history, fks) {
                         console_actions.push((c.id, a));
                     }
                 }
@@ -492,7 +544,7 @@ impl eframe::App for App {
         });
         for (console, action) in console_actions {
             match action {
-                ConsoleAction::Run { statements, limit, replace } => self.start_run(console, statements, limit, replace),
+                ConsoleAction::Run { statements, limit, mode } => self.start_run(console, statements, limit, mode),
                 ConsoleAction::Cancel => {
                     if let Some(c) = self.console_mut(console)
                         && let Some(run) = &c.run
