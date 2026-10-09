@@ -18,6 +18,12 @@ pub struct EditingCell {
     focused: bool,
 }
 
+impl EditingCell {
+    pub fn new(row: RowRef, col: usize, buffer: String) -> Self {
+        Self { row, col, buffer, focused: false }
+    }
+}
+
 /// Editing state handed to the grid when the result can be written back.
 pub struct GridEdit<'a> {
     pub edits: &'a mut Edits,
@@ -419,12 +425,37 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                     r.request_focus();
                                     cell.focused = true;
                                 }
-                                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                let (escape, tab, back) = ui.input(|i| {
+                                    (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Tab), i.modifiers.shift)
+                                });
                                 if escape {
                                     *e.editing = None;
                                 } else if r.lost_focus() {
                                     let text = std::mem::take(&mut cell.buffer);
                                     *e.editing = None;
+                                    // Tab / Shift+Tab: save this cell and edit the next / previous one.
+                                    let next = match (tab, back) {
+                                        (true, false) => Some(c + 1).filter(|&n| n < rs.columns.len()),
+                                        (true, true) => c.checked_sub(1),
+                                        _ => None,
+                                    };
+                                    if let Some(n) = next {
+                                        let current = match row_ref {
+                                            RowRef::Existing(r) => Some(
+                                                e.edits
+                                                    .updates
+                                                    .get(&(r, n))
+                                                    .cloned()
+                                                    .unwrap_or_else(|| rs.rows[r][n].clone()),
+                                            ),
+                                            RowRef::New(i) => e.edits.inserts[i][n].clone(),
+                                        };
+                                        let buffer = match current {
+                                            Some(v) if !v.is_null() => v.to_string(),
+                                            _ => String::new(),
+                                        };
+                                        *e.editing = Some(EditingCell::new(row_ref, n, buffer));
+                                    }
                                     // Typed booleans become real ones, so the cell shows a checkbox.
                                     let was_null = value.as_ref().is_none_or(|v| v.is_null());
                                     match parse_bool(&text).filter(|_| m.boolean) {

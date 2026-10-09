@@ -343,6 +343,22 @@ async fn password_for(config: &DataSourceConfig, password: Option<String>) -> Db
 }
 
 async fn open(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
+    let conn = open_engine(config, password).await?;
+    if config.read_only {
+        // The engine enforces it too where it can; Oracle relies on the app's checks.
+        let sql = match conn.dialect() {
+            dbm_core::Dialect::Postgres => Some("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+            dbm_core::Dialect::Sqlite => Some("PRAGMA query_only = ON"),
+            dbm_core::Dialect::Oracle => None,
+        };
+        if let Some(sql) = sql {
+            conn.execute(sql, &[], None).await?;
+        }
+    }
+    Ok(conn)
+}
+
+async fn open_engine(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
     match &config.kind {
         DataSourceKind::Oracle { host, port, service, user, client_dir } => {
             let password = password_for(config, password).await?;

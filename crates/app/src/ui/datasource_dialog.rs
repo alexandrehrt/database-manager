@@ -29,6 +29,7 @@ pub struct DataSourceDialog {
     editing: Option<String>,
     name: String,
     color: Option<ConnColor>,
+    read_only: bool,
     engine: Engine,
     host: String,
     port: String,
@@ -68,6 +69,7 @@ impl DataSourceDialog {
             editing: None,
             name: String::new(),
             color: None,
+            read_only: false,
             engine: Engine::Postgres,
             host: "localhost".into(),
             port: "5432".into(),
@@ -90,6 +92,7 @@ impl DataSourceDialog {
         d.editing = Some(config.id.clone());
         d.name = config.name.clone();
         d.color = config.color;
+        d.read_only = config.read_only;
         match &config.kind {
             DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
                 d.engine = Engine::Postgres;
@@ -162,7 +165,7 @@ impl DataSourceDialog {
             n => n.to_string(),
         };
         let id = self.editing.clone().unwrap_or_else(new_id);
-        Ok(DataSourceConfig { id, name, kind, color: self.color })
+        Ok(DataSourceConfig { id, name, kind, color: self.color, read_only: self.read_only })
     }
 
     fn save(&mut self, connect: bool) -> Option<DialogAction> {
@@ -450,6 +453,9 @@ impl DataSourceDialog {
                 .small()
                 .color(color::TEXT_WEAK),
         );
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.read_only, "Read-only")
+            .on_hover_text("Only queries run; changes to data or schema and grid editing are blocked.");
     }
 
     /// Test result and validation errors.

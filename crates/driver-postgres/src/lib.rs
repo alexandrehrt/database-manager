@@ -83,6 +83,11 @@ pub(crate) fn pg_err(e: tokio_postgres::Error) -> DbError {
             message: db.message().to_string(),
             detail: db.detail().or(db.hint()).map(str::to_string),
             code: Some(db.code().code().to_string()),
+            // 1-based character index into the statement as sent.
+            position: match db.position() {
+                Some(tokio_postgres::error::ErrorPosition::Original(n)) => (*n as usize).checked_sub(1),
+                _ => None,
+            },
         },
         None => DbError::new(e.to_string()),
     }

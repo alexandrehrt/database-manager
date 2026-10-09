@@ -474,29 +474,64 @@ pub fn find_all(hay: &str, needle: &str, case_sensitive: bool) -> Vec<std::ops::
     out
 }
 
-/// For an UPDATE or DELETE without a WHERE clause: what it targets, such as
-/// "DELETE FROM orders", for a confirmation. None for anything else.
-pub fn unrestricted_write(sql: &str) -> Option<String> {
+/// The statement's first word, after comments.
+pub fn first_word(sql: &str) -> &str {
+    match tokenize(sql).into_iter().map(|(t, _)| t).find(|t| !matches!(t, Tok::LineComment(_) | Tok::BlockComment(_))) {
+        Some(Tok::Word(w)) => w,
+        _ => "",
+    }
+}
+
+/// A statement that destroys data in bulk: UPDATE / DELETE without WHERE,
+/// DROP or TRUNCATE. Returns what it targets ("DELETE FROM orders") and why it
+/// needs confirming, or None for anything else.
+pub fn unrestricted_write(sql: &str) -> Option<(String, &'static str)> {
     let (toks, _): (Vec<Tok<'_>>, Vec<bool>) = tokenize(sql).into_iter().unzip();
     let words = |t: &Tok<'_>| if let Tok::Word(w) = t { Some(w.to_ascii_uppercase()) } else { None };
     let first = toks.iter().find_map(words)?;
-    if first != "UPDATE" && first != "DELETE" {
-        return None;
-    }
-    let mut depth = 0usize;
-    for t in &toks {
-        match t {
-            Tok::Punct("(") => depth += 1,
-            Tok::Punct(")") => depth = depth.saturating_sub(1),
-            Tok::Word(w) if depth == 0 && w.eq_ignore_ascii_case("WHERE") => return None,
-            _ => {}
+    let reason = match first.as_str() {
+        "UPDATE" | "DELETE" => "no WHERE clause: affects every row",
+        "DROP" => "removes it for good",
+        "TRUNCATE" => "removes every row",
+        _ => return None,
+    };
+    if first == "UPDATE" || first == "DELETE" {
+        let mut depth = 0usize;
+        for t in &toks {
+            match t {
+                Tok::Punct("(") => depth += 1,
+                Tok::Punct(")") => depth = depth.saturating_sub(1),
+                Tok::Word(w) if depth == 0 && w.eq_ignore_ascii_case("WHERE") => return None,
+                _ => {}
+            }
         }
     }
     // The verb (with FROM / ONLY) upper-cased, then the table name as written.
     let mut head = Vec::new();
     let mut rest = toks.iter().skip_while(|t| words(t).is_none()).peekable();
     while let Some(Tok::Word(w)) = rest.peek() {
-        if !matches!(w.to_ascii_uppercase().as_str(), "UPDATE" | "DELETE" | "FROM" | "ONLY") {
+        if !matches!(
+            w.to_ascii_uppercase().as_str(),
+            "UPDATE"
+                | "DELETE"
+                | "FROM"
+                | "ONLY"
+                | "DROP"
+                | "TRUNCATE"
+                | "TABLE"
+                | "VIEW"
+                | "MATERIALIZED"
+                | "INDEX"
+                | "SCHEMA"
+                | "SEQUENCE"
+                | "DATABASE"
+                | "FUNCTION"
+                | "PROCEDURE"
+                | "TRIGGER"
+                | "TYPE"
+                | "IF"
+                | "EXISTS"
+        ) {
             break;
         }
         head.push(w.to_ascii_uppercase());
@@ -512,5 +547,5 @@ pub fn unrestricted_write(sql: &str) -> Option<String> {
         }
     }
     head.push(name);
-    Some(head.join(" "))
+    Some((head.join(" "), reason))
 }
