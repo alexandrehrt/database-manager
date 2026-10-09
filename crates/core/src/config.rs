@@ -60,15 +60,13 @@ pub enum DataSourceKind {
     Sqlite {
         path: PathBuf,
     },
-    /// Needs Oracle Instant Client; `client_dir` points at it when it isn't
-    /// on the system library path.
+    /// Connects with the thin driver; no Oracle client software is needed.
+    /// (Older configs may still carry a `client_dir`, which is ignored.)
     Oracle {
         host: String,
         port: u16,
         service: String,
         user: String,
-        #[serde(default)]
-        client_dir: Option<PathBuf>,
     },
 }
 

@@ -7,4 +7,7 @@ edition.workspace = true
 dbm-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-oracle = "0.6"
+serde_json.workspace = true
+# Pure-Rust thin driver: no Oracle Client libraries needed. Pinned while in beta.
+oracledb = "=26.0.0-beta.4"
+chrono = { version = "0.4", default-features = false, features = ["std"] }

@@ -360,7 +360,7 @@ async fn open(config: &DataSourceConfig, password: Option<String>) -> DbResult<S
 
 async fn open_engine(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
     match &config.kind {
-        DataSourceKind::Oracle { host, port, service, user, client_dir } => {
+        DataSourceKind::Oracle { host, port, service, user } => {
             let password = password_for(config, password).await?;
             let conn = dbm_driver_oracle::connect(dbm_driver_oracle::OracleParams {
                 host,
@@ -368,7 +368,6 @@ async fn open_engine(config: &DataSourceConfig, password: Option<String>) -> DbR
                 service,
                 user,
                 password: password.as_deref(),
-                client_dir: client_dir.as_deref(),
             })
             .await?;
             Ok(Arc::new(conn))

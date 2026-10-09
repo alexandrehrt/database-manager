@@ -69,6 +69,8 @@ struct PendingRun {
 /// An action held back because it would discard an open transaction.
 enum Confirm {
     CloseConsole(u64),
+    /// Cancel on Oracle replaces the session, losing the console's open transaction.
+    CancelRun(u64),
     Disconnect(String),
     Quit,
 }
@@ -979,6 +981,18 @@ impl App {
         }
     }
 
+    /// Stops the console's run: no further statements, and the running one is cancelled.
+    fn cancel_run(&mut self, console: u64) {
+        if let Some(c) = self.console_mut(console)
+            && let Some(run) = &c.run
+        {
+            run.stop.store(true, Ordering::Relaxed);
+            if let Some(conn) = self.worker.console_connection(console) {
+                self.worker.cancel(conn);
+            }
+        }
+    }
+
     fn apply_console(&mut self, console: u64, action: ConsoleAction) {
         match action {
             ConsoleAction::Run { statements, limit, mode } => {
@@ -993,13 +1007,13 @@ impl App {
                 self.start_run(console, statements, limit, mode)
             }
             ConsoleAction::Cancel => {
-                if let Some(c) = self.console_mut(console)
-                    && let Some(run) = &c.run
-                {
-                    run.stop.store(true, Ordering::Relaxed);
-                    if let Some(conn) = self.worker.console_connection(console) {
-                        self.worker.cancel(conn);
-                    }
+                let oracle_tx = self
+                    .console_mut(console)
+                    .is_some_and(|c| c.dialect == dbm_core::Dialect::Oracle && c.in_transaction);
+                if oracle_tx {
+                    self.confirm = Some(Confirm::CancelRun(console));
+                } else {
+                    self.cancel_run(console);
                 }
             }
             ConsoleAction::SubmitEdits { tab, statements } => {
@@ -1575,6 +1589,12 @@ impl App {
                 "Roll back and disconnect",
             ),
             Confirm::Quit => (format!("If you quit, {}.", losses(self.tabs.iter().collect())), "Quit anyway"),
+            Confirm::CancelRun(_) => (
+                "Oracle can't interrupt a running statement here, so cancelling switches this console to a new \
+                 session. The open transaction is rolled back."
+                    .to_string(),
+                "Roll back and cancel",
+            ),
         };
         let mut decision = None;
         let modal = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
@@ -1609,6 +1629,7 @@ impl App {
                 }
             }
             Confirm::Disconnect(id) => self.disconnect_source(&id),
+            Confirm::CancelRun(id) => self.cancel_run(id),
             Confirm::Quit => {
                 self.quit_confirmed = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

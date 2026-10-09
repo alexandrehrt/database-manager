@@ -41,8 +41,6 @@ pub struct DataSourceDialog {
     ssl_mode: SslMode,
     path: String,
     service: String,
-    /// Oracle Instant Client folder; empty means the system library path.
-    client_dir: String,
     pub test: Option<TestState>,
     error: Option<String>,
 }
@@ -81,7 +79,6 @@ impl DataSourceDialog {
             ssl_mode: SslMode::Prefer,
             path: String::new(),
             service: "FREEPDB1".into(),
-            client_dir: String::new(),
             test: None,
             error: None,
         }
@@ -106,13 +103,12 @@ impl DataSourceDialog {
                 d.engine = Engine::Sqlite;
                 d.path = path.display().to_string();
             }
-            DataSourceKind::Oracle { host, port, service, user, client_dir } => {
+            DataSourceKind::Oracle { host, port, service, user } => {
                 d.engine = Engine::Oracle;
                 d.host = host.clone();
                 d.port = port.to_string();
                 d.service = service.clone();
                 d.user = user.clone();
-                d.client_dir = client_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
             }
         }
         d
@@ -152,7 +148,6 @@ impl DataSourceDialog {
                     port: port()?,
                     service: self.service.trim().to_string(),
                     user: self.user.trim().to_string(),
-                    client_dir: Some(self.client_dir.trim()).filter(|d| !d.is_empty()).map(PathBuf::from),
                 }
             }
         })
@@ -250,7 +245,7 @@ impl DataSourceDialog {
         let cards = [
             (Engine::Postgres, icon::DATABASE, "PostgreSQL", "Network server"),
             (Engine::Sqlite, icon::FILE_TEXT, "SQLite", "Local file"),
-            (Engine::Oracle, icon::HARD_DRIVES, "Oracle", "Needs Instant Client"),
+            (Engine::Oracle, icon::HARD_DRIVES, "Oracle", "Network server"),
         ];
         let gap = 10.0;
         let width = (CONTENT - gap * (cards.len() as f32 - 1.0)) / cards.len() as f32;
@@ -372,24 +367,6 @@ impl DataSourceDialog {
                     &[(SslMode::Disable, "disable"), (SslMode::Prefer, "prefer"), (SslMode::Require, "require")],
                 );
             });
-        }
-        if self.engine == Engine::Oracle {
-            ui.add_space(4.0);
-            labeled(ui, "Instant Client folder (optional)", full, |ui| {
-                ui.horizontal(|ui| {
-                    let w = ui.available_width() - 96.0;
-                    ui.add_sized([w, 30.0], text_edit(&mut self.client_dir, "uses the system library path if empty"));
-                    if ui.add_sized([88.0, 30.0], egui::Button::new(format!("{}  Browse", icon::FOLDER_OPEN))).clicked()
-                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.client_dir = dir.display().to_string();
-                    }
-                });
-            });
-            ui.hyperlink_to(
-                RichText::new("Download Oracle Instant Client (Basic package)").small(),
-                "https://www.oracle.com/database/technologies/instant-client/downloads.html",
-            );
         }
     }
 

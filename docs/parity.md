@@ -17,7 +17,7 @@ What the app covers compared with DataGrip, as of v3, limited to PostgreSQL, SQL
 | SQLite file connection | Done | Creates the file if it doesn't exist. Foreign keys are enforced. |
 | Password storage | Done | Keychain, or session-only |
 | SSH tunnel, proxy, connection URL editing | Not yet | |
-| Oracle connection | Partial | Needs Oracle Instant Client. FK links and grid editing only for simple single-table SELECTs, since Oracle doesn't report column origins. |
+| Oracle connection | Partial | Thin driver, no client software. FK links and grid editing only for simple single-table SELECTs, since Oracle doesn't report column origins. Cancel abandons the statement and opens a new session. |
 | Other engines (MySQL, SQL Server, …) | Not yet | Each would be another `Connection` implementation. |
 
 ## Database explorer
