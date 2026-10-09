@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use dbm_core::ExecOutcome;
 use dbm_core::config::DataSourceConfig;
 use dbm_core::fk_nav::ForeignKeyIndex;
-use dbm_core::ExecOutcome;
 use eframe::egui;
 
 use crate::persist;
@@ -31,6 +31,10 @@ pub enum Action {
 }
 
 const HISTORY_LIMIT: usize = 200;
+
+const NEW_SOURCE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
+const NEW_CONSOLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
+const CLOSE_TAB: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
 
 enum Tab {
     Console(Box<Console>),
@@ -178,12 +182,34 @@ impl App {
         let tables: HashSet<(String, String)> =
             rs.columns.iter().filter_map(|c| c.origin.as_ref()).map(|o| (o.schema.clone(), o.table.clone())).collect();
         for (schema, table) in tables {
-            let cached = self.fk_cache.get(source).is_some_and(|idx| idx.contains_key(&(schema.clone(), table.clone())));
+            let cached =
+                self.fk_cache.get(source).is_some_and(|idx| idx.contains_key(&(schema.clone(), table.clone())));
             let key = (source.to_string(), schema.clone(), table.clone());
             if cached || !self.fk_pending.insert(key) {
                 continue;
             }
             self.apply(Action::LoadDetails(source.to_string(), schema, table));
+        }
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        if let Tab::Console(c) = &self.tabs[i]
+            && let Some(run) = &c.run
+        {
+            run.stop.store(true, Ordering::Relaxed);
+        }
+        self.tabs.remove(i);
+        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// The data source a new console should use: the active console's, else the first one.
+    fn current_source(&self) -> Option<String> {
+        match self.tabs.get(self.active_tab) {
+            Some(Tab::Console(c)) => Some(c.source.clone()),
+            _ => self.sources.first().map(|s| s.id.clone()),
         }
     }
 
@@ -249,7 +275,8 @@ impl App {
                     match mode {
                         RunMode::Replace(i) if i < c.results.len() => {
                             let old = &c.results[i];
-                            let (limit, title, sort_column) = (old.limit + PAGE_SIZE, old.title.clone(), old.sort.column);
+                            let (limit, title, sort_column) =
+                                (old.limit + PAGE_SIZE, old.title.clone(), old.sort.column);
                             c.results[i] = ResultTab { limit, title, ..tab };
                             c.results[i].sort.column = sort_column;
                         }
@@ -470,12 +497,52 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut actions = Vec::new();
+        let mut close_active = false;
+        if self.dialog.is_none() {
+            ui.input_mut(|i| {
+                if i.consume_shortcut(&NEW_SOURCE) {
+                    actions.push(Action::NewSource);
+                }
+                if i.consume_shortcut(&CLOSE_TAB) {
+                    close_active = true;
+                }
+                if i.consume_shortcut(&NEW_CONSOLE)
+                    && let Some(source) = self.current_source()
+                {
+                    actions.push(Action::NewConsole(source));
+                }
+            });
+        }
 
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New data source…").clicked() {
+                    let ctx = ui.ctx().clone();
+                    if ui
+                        .add(egui::Button::new("New data source…").shortcut_text(ctx.format_shortcut(&NEW_SOURCE)))
+                        .clicked()
+                    {
                         actions.push(Action::NewSource);
+                    }
+                    let source = self.current_source();
+                    if ui
+                        .add_enabled(
+                            source.is_some(),
+                            egui::Button::new("New console").shortcut_text(ctx.format_shortcut(&NEW_CONSOLE)),
+                        )
+                        .clicked()
+                        && let Some(source) = source
+                    {
+                        actions.push(Action::NewConsole(source));
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.tabs.is_empty(),
+                            egui::Button::new("Close tab").shortcut_text(ctx.format_shortcut(&CLOSE_TAB)),
+                        )
+                        .clicked()
+                    {
+                        close_active = true;
                     }
                 });
             });
@@ -521,13 +588,7 @@ impl eframe::App for App {
             });
             ui.separator();
             if let Some(i) = close {
-                if let Tab::Console(c) = &self.tabs[i]
-                    && let Some(run) = &c.run
-                {
-                    run.stop.store(true, Ordering::Relaxed);
-                }
-                self.tabs.remove(i);
-                self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+                self.close_tab(i);
                 return;
             }
             let active = self.active_tab.min(self.tabs.len() - 1);
@@ -542,6 +603,9 @@ impl eframe::App for App {
                 Tab::Ddl { text, .. } => ddl_view(ui, text),
             }
         });
+        if close_active {
+            self.close_tab(self.active_tab);
+        }
         for (console, action) in console_actions {
             match action {
                 ConsoleAction::Run { statements, limit, mode } => self.start_run(console, statements, limit, mode),
@@ -584,7 +648,12 @@ fn ddl_view(ui: &mut egui::Ui, text: &Loadable<String>) {
             };
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 let mut view = ddl.as_str();
-                ui.add(egui::TextEdit::multiline(&mut view).code_editor().desired_width(f32::INFINITY).layouter(&mut layouter));
+                ui.add(
+                    egui::TextEdit::multiline(&mut view)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter),
+                );
             });
         }
         Loadable::Failed(e) => {
