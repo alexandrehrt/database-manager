@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use dbm_core::{DbError, Dialect, ExecOutcome, IncomingKey, TableDetails, Value, sql_split};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
+use crate::ui::completion::{self, Catalog, Item};
 use crate::ui::edits::{self, EditStatement, Edits};
 use crate::ui::grid::{self, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
 use crate::ui::sql_highlight;
@@ -127,6 +128,15 @@ impl TableView {
     }
 }
 
+/// The open completion list.
+pub struct CompletionPopup {
+    items: Vec<Item>,
+    selected: usize,
+    /// Byte offset of the word being completed.
+    start: usize,
+    anchor: egui::Pos2,
+}
+
 pub struct Console {
     pub id: u64,
     pub source: String,
@@ -148,6 +158,11 @@ pub struct Console {
     pub tx_notice: Option<Result<String, String>>,
     /// Set for consoles opened on a table's data.
     pub table: Option<TableView>,
+    pub completion: Option<CompletionPopup>,
+    /// Recompute completion once metadata arrives (columns were missing).
+    completion_waiting: bool,
+    /// Tables whose columns completion needs; the app loads and drains these.
+    pub wanted_details: Vec<(String, String)>,
 }
 
 pub enum ConsoleAction {
@@ -184,6 +199,9 @@ impl Console {
             tx_busy: false,
             tx_notice: None,
             table: None,
+            completion: None,
+            completion_waiting: false,
+            wanted_details: Vec::new(),
         }
     }
 
@@ -196,10 +214,29 @@ impl Console {
         fks: &ForeignKeyIndex,
         tables: &HashMap<(String, String), TableDetails>,
         incoming: &HashMap<(String, String), Vec<IncomingKey>>,
+        catalog: &Catalog<'_>,
     ) -> Option<ConsoleAction> {
         let mut action = None;
         let editor_id = egui::Id::new(("console-editor", self.id));
         let editor_focused = ui.memory(|m| m.has_focus(editor_id));
+        if !editor_focused {
+            self.completion = None;
+        }
+        // Completion keys, taken before the editor would act on them.
+        let manual = editor_focused && ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space));
+        let (down, up, accept, dismiss) = if self.completion.is_some() {
+            ui.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                )
+            })
+        } else {
+            (false, false, false, false)
+        };
+        let mut editor_out = None;
         // Consume the shortcuts before the editor sees them, or Enter would insert a newline.
         let (run_one, run_all) = if editor_focused {
             // RUN_ALL first: Cmd+Enter also matches Cmd+Shift+Enter logically.
@@ -273,19 +310,45 @@ impl Console {
                 egui::ScrollArea::vertical().id_salt(("editor-scroll", self.id)).auto_shrink([false, false]).show(
                     ui,
                     |ui| {
-                        ui.add_sized(
-                            ui.available_size(),
-                            egui::TextEdit::multiline(&mut self.sql)
-                                .id(editor_id)
-                                .code_editor()
-                                .lock_focus(true)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("Write SQL here. Cmd+Enter runs the statement under the cursor.")
-                                .layouter(&mut layouter),
-                        );
+                        let output = egui::TextEdit::multiline(&mut self.sql)
+                            .id(editor_id)
+                            .code_editor()
+                            .lock_focus(true)
+                            .desired_width(f32::INFINITY)
+                            .min_size(ui.available_size())
+                            .hint_text("Write SQL here. Cmd+Enter runs the statement under the cursor.")
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        editor_out = Some((
+                            output.response.response.changed(),
+                            output.cursor_range.map(|r| r.primary.index.0),
+                            output.galley.clone(),
+                            output.galley_pos,
+                        ));
                     },
                 );
             });
+
+        if let Some((changed, Some(cursor), galley, galley_pos)) = editor_out {
+            self.update_completion(ui, editor_id, catalog, (changed, cursor, &galley, galley_pos), manual);
+            if let Some(popup) = &mut self.completion {
+                let last = popup.items.len().saturating_sub(1);
+                if down {
+                    popup.selected = (popup.selected + 1).min(last);
+                }
+                if up {
+                    popup.selected = popup.selected.saturating_sub(1);
+                }
+            }
+            if dismiss {
+                self.completion = None;
+            }
+            let clicked = self.completion_popup(ui);
+            if let Some(i) = clicked.or_else(|| accept.then(|| self.completion.as_ref().map(|p| p.selected)).flatten())
+            {
+                self.accept_completion(ui, editor_id, cursor, i);
+            }
+        }
 
         if self.run.is_none() {
             if run_one {
@@ -335,6 +398,106 @@ impl Console {
             }
             None => {}
         }
+    }
+
+    /// Opens, refreshes or closes the completion list after this frame's edit.
+    fn update_completion(
+        &mut self,
+        ui: &egui::Ui,
+        editor_id: egui::Id,
+        catalog: &Catalog<'_>,
+        (changed, cursor_char, galley, galley_pos): (bool, usize, &std::sync::Arc<egui::Galley>, egui::Pos2),
+        manual: bool,
+    ) {
+        if !ui.memory(|m| m.has_focus(editor_id)) {
+            return;
+        }
+        let cursor = self.sql.char_indices().nth(cursor_char).map_or(self.sql.len(), |(b, _)| b);
+        let typed_ident =
+            changed && self.sql[..cursor].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
+        let open = self.completion.is_some();
+        if !(manual || typed_ident || (open && changed) || self.completion_waiting) {
+            // The cursor moved away from the word being completed.
+            if let Some(p) = &self.completion
+                && completion::context(&self.sql, cursor).start != p.start
+            {
+                self.completion = None;
+            }
+            return;
+        }
+        if changed && !typed_ident {
+            self.completion = None;
+            self.completion_waiting = false;
+            return;
+        }
+        if completion::in_literal_or_comment(&self.sql, cursor) {
+            self.completion = None;
+            return;
+        }
+        let ctx = completion::context(&self.sql, cursor);
+        let statement = statement_at(&self.sql, cursor, self.dialect).map_or("", |r| &self.sql[r]);
+        let (items, missing) = completion::candidates(self.dialect, &ctx, statement, catalog);
+        self.completion_waiting = items.is_empty() && !missing.is_empty();
+        self.wanted_details.extend(missing);
+        if items.is_empty() || (!manual && !open && ctx.prefix.is_empty() && ctx.qualifier.is_none()) {
+            self.completion = None;
+            return;
+        }
+        let at = galley.pos_from_cursor(egui::text::CCursor::new(cursor_char));
+        let anchor = galley_pos + at.left_bottom().to_vec2() + egui::vec2(0.0, 2.0);
+        let selected = self.completion.as_ref().filter(|p| p.start == ctx.start).map_or(0, |p| p.selected);
+        let selected = selected.min(items.len() - 1);
+        self.completion = Some(CompletionPopup { items, selected, start: ctx.start, anchor });
+    }
+
+    /// Draws the completion list; returns a clicked item.
+    fn completion_popup(&self, ui: &egui::Ui) -> Option<usize> {
+        let popup = self.completion.as_ref()?;
+        let mut clicked = None;
+        egui::Area::new(egui::Id::new(("completion", self.id)))
+            .fixed_pos(popup.anchor)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(260.0);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for (i, item) in popup.items.iter().enumerate().take(200) {
+                            let r = ui
+                                .horizontal(|ui| {
+                                    let r = ui
+                                        .selectable_label(i == popup.selected, RichText::new(&item.label).monospace());
+                                    ui.weak(&item.detail);
+                                    r
+                                })
+                                .inner;
+                            if r.clicked() {
+                                clicked = Some(i);
+                            }
+                            if i == popup.selected {
+                                r.scroll_to_me(None);
+                            }
+                        }
+                    });
+                });
+            });
+        clicked
+    }
+
+    /// Replaces the word being completed with item `i` and puts the cursor after it.
+    fn accept_completion(&mut self, ui: &egui::Ui, editor_id: egui::Id, cursor_char: usize, i: usize) {
+        let Some(popup) = self.completion.take() else { return };
+        let Some(item) = popup.items.get(i) else { return };
+        let cursor = self.sql.char_indices().nth(cursor_char).map_or(self.sql.len(), |(b, _)| b);
+        let start = popup.start.min(cursor);
+        self.sql.replace_range(start..cursor, &item.insert);
+        let new_cursor = self.sql[..start].chars().count() + item.insert.chars().count();
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), editor_id) {
+            let at = egui::text::CCursor::new(new_cursor);
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(at)));
+            state.store(ui.ctx(), editor_id);
+        }
+        ui.memory_mut(|m| m.request_focus(editor_id));
+        self.completion_waiting = false;
     }
 
     fn run_all(&self) -> Option<ConsoleAction> {
