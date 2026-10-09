@@ -9,7 +9,7 @@ use dbm_core::{ExecOutcome, TableDetails};
 use eframe::egui;
 
 use crate::persist;
-use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TxMode};
+use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TableView, TxMode};
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
 use crate::ui::explorer::{self, ConnStatus, Loadable, RelationNode, SchemaNode, SourceTree};
 use crate::worker::{Event, Worker};
@@ -87,6 +87,8 @@ pub struct App {
     table_cache: HashMap<String, HashMap<(String, String), TableDetails>>,
     /// Foreign keys pointing at each table, per data source, for "Referencing rows".
     incoming_cache: HashMap<String, HashMap<(String, String), Vec<dbm_core::IncomingKey>>>,
+    /// Last WHERE / ORDER BY per (source, schema, table), for this session.
+    table_filters: HashMap<(String, String, String), (String, String)>,
     fk_pending: HashSet<(String, String, String)>,
 }
 
@@ -114,6 +116,7 @@ impl App {
             fk_cache: HashMap::new(),
             table_cache: HashMap::new(),
             incoming_cache: HashMap::new(),
+            table_filters: HashMap::new(),
             fk_pending: HashSet::new(),
         }
     }
@@ -388,6 +391,29 @@ impl App {
                             tab.sort.column = c.results[i].sort.column;
                             c.results[i] = tab;
                         }
+                        RunMode::Filter => {
+                            let failed = tab.outcome.as_ref().err().map(|e| e.message.clone());
+                            match failed {
+                                Some(message) if !c.results.is_empty() => {
+                                    if let Some(tv) = &mut c.table {
+                                        tv.error = Some(message);
+                                    }
+                                }
+                                _ => {
+                                    if let Some(tv) = &mut c.table {
+                                        tv.error = None;
+                                    }
+                                    if c.results.is_empty() {
+                                        c.results.push(tab);
+                                    } else {
+                                        c.results[0] = tab;
+                                    }
+                                    c.active_result = 0;
+                                    c.nav_back.clear();
+                                    c.nav_forward.clear();
+                                }
+                            }
+                        }
                         RunMode::Navigate { from, title } => {
                             tab.title = Some(title);
                             c.results.push(tab);
@@ -533,9 +559,18 @@ impl App {
             }
             Action::OpenTable { source, schema, table } => {
                 let Some(dialect) = self.source(&source).map(|s| s.kind.dialect()) else { return };
-                let sql = dialect.select_all(&schema, &table);
+                let (filter, order) = self
+                    .table_filters
+                    .get(&(source.clone(), schema.clone(), table.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                let view = TableView::new(schema, table.clone(), filter, order);
+                let sql = view.sql(dialect);
                 if let Some(id) = self.new_console(&source, Some(table), sql.clone()) {
-                    self.start_run(id, vec![(sql, Vec::new())], PAGE_SIZE, RunMode::Fresh);
+                    if let Some(c) = self.console_mut(id) {
+                        c.table = Some(view);
+                    }
+                    self.start_run(id, vec![(sql, Vec::new())], PAGE_SIZE, RunMode::Filter);
                 }
             }
             Action::ShowDdl { source, schema, table } => {
@@ -737,7 +772,17 @@ impl eframe::App for App {
         }
         for (console, action) in console_actions {
             match action {
-                ConsoleAction::Run { statements, limit, mode } => self.start_run(console, statements, limit, mode),
+                ConsoleAction::Run { statements, limit, mode } => {
+                    if matches!(mode, RunMode::Filter)
+                        && let Some(c) = self.console_mut(console)
+                        && let Some(tv) = &c.table
+                    {
+                        let key = (c.source.clone(), tv.schema.clone(), tv.table.clone());
+                        let value = (tv.filter.clone(), tv.order.clone());
+                        self.table_filters.insert(key, value);
+                    }
+                    self.start_run(console, statements, limit, mode)
+                }
                 ConsoleAction::Cancel => {
                     if let Some(c) = self.console_mut(console)
                         && let Some(run) = &c.run

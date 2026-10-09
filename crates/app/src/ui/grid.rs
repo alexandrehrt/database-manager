@@ -111,6 +111,10 @@ pub struct GridOptions<'a> {
     /// For a fetched row: the referencing tables that can be opened, as
     /// (key index, label).
     pub referencing: &'a dyn Fn(usize) -> Vec<(usize, String)>,
+    /// `Some` when the data is sorted by the server (table data): holds the
+    /// current sort for the header arrows, and header clicks are reported as
+    /// [`GridEvent::SortBy`] instead of sorting the loaded rows.
+    pub server_sort: Option<Option<(usize, bool)>>,
 }
 
 /// Navigation the caller performs, in data-row terms.
@@ -119,6 +123,8 @@ pub enum GridEvent {
     Link(usize, usize),
     /// Open the rows of referencing key `key` that point at `row`.
     Referencing { row: usize, key: usize },
+    /// Header of column `col` clicked while sorting is server-side.
+    SortBy(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -176,7 +182,8 @@ fn cell_text(v: &Value) -> String {
 /// `edit`, cells can be edited (double-click), set to NULL and reverted,
 /// rows deleted, and added rows are shown after the fetched ones.
 pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridOptions<'_>) -> Option<GridEvent> {
-    let GridOptions { id, is_link, mut edit, selection, dialect, table, referencing } = opts;
+    let GridOptions { id, is_link, mut edit, selection, dialect, table, referencing, server_sort } = opts;
+    let shown_sort = server_sort.unwrap_or(sort.column);
     sort.refresh(rs);
     selection.rows.retain(|&r| r < rs.rows.len());
 
@@ -219,7 +226,7 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                 });
                 for (i, col) in rs.columns.iter().enumerate() {
                     header.col(|ui| {
-                        let arrow = match sort.column {
+                        let arrow = match shown_sort {
                             Some((c, true)) if c == i => " ^",
                             Some((c, false)) if c == i => " v",
                             _ => "",
@@ -444,7 +451,11 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
     });
 
     if let Some(col) = clicked_header {
-        sort.toggle(col);
+        if server_sort.is_some() {
+            clicked_link = Some(GridEvent::SortBy(col));
+        } else {
+            sort.toggle(col);
+        }
     }
     if let Some((display, row)) = clicked_row {
         selection.click(display, row, &sort.order, modifiers);
