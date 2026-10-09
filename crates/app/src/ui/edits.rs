@@ -49,6 +49,7 @@ fn same_value(original: &Value, edited: &Value) -> bool {
     match (original, edited) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Json(j), Value::Text(t)) => serde_json::from_str::<serde_json::Value>(t).is_ok_and(|v| v == *j),
         (o, Value::Text(t)) => o.to_string() == *t,
         (Value::Int(i), Value::Bool(b)) | (Value::Bool(b), Value::Int(i)) => *i == *b as i64,
         (o, e) => o == e,

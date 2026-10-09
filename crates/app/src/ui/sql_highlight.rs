@@ -192,3 +192,46 @@ pub fn layout(ui: &egui::Ui, text: &str, wrap_width: f32) -> LayoutJob {
     }
     job
 }
+
+/// JSON highlighting for the value viewer: keys, strings, numbers and literals.
+pub fn json_layout(ui: &egui::Ui, text: &str, wrap_width: f32) -> LayoutJob {
+    let palette = Palette::for_visuals(ui.visuals());
+    let font = FontId::monospace(12.5);
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let mut push = |s: &str, color: Color32| {
+        job.append(s, 0.0, TextFormat { font_id: font.clone(), color, ..Default::default() });
+    };
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        let b = bytes[i];
+        let color = if b == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(bytes.len());
+            // A string followed by ':' is a key.
+            let key = text[i..].trim_start().starts_with(':');
+            if key { palette.keyword } else { palette.string }
+        } else if b == b'-' || b.is_ascii_digit() {
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'+' | b'-')) {
+                i += 1;
+            }
+            palette.number
+        } else if b.is_ascii_alphabetic() {
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            palette.number
+        } else {
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
+            palette.plain
+        };
+        push(&text[start..i], color);
+    }
+    job
+}
