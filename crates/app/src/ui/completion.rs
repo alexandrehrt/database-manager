@@ -225,7 +225,7 @@ pub struct Catalog<'a> {
 }
 
 impl Catalog<'_> {
-    fn resolve(&self, schema: Option<&str>, table: &str) -> Option<(String, String)> {
+    pub fn resolve(&self, schema: Option<&str>, table: &str) -> Option<(String, String)> {
         let schema = schema.unwrap_or(self.default_schema);
         let exact = self.tables.iter().find(|(s, t)| s == schema && t.eq_ignore_ascii_case(table));
         exact.or_else(|| self.tables.iter().find(|(_, t)| t.eq_ignore_ascii_case(table))).cloned()

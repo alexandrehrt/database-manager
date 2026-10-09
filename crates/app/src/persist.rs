@@ -99,6 +99,9 @@ pub struct SessionTab {
     pub saved_text: Option<String>,
     #[serde(default)]
     pub table: Option<SessionTable>,
+    /// Schema of a diagram tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagram: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]

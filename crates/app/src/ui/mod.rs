@@ -1,11 +1,13 @@
 pub mod completion;
 pub mod console;
 pub mod datasource_dialog;
+pub mod diagram;
 pub mod editor_ops;
 pub mod edits;
 pub mod explorer;
 pub mod goto;
 pub mod grid;
+pub mod inspect;
 pub mod sql_format;
 pub mod sql_highlight;
 pub mod theme;

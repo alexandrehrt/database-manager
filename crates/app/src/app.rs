@@ -14,6 +14,7 @@ use crate::ui::console::{
     ViewMode,
 };
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
+use crate::ui::diagram::Diagram;
 use crate::ui::explorer::{self, ConnStatus, Loadable, SchemaNode, SidebarState, SourceTree};
 use crate::ui::goto::{Candidate, GotoOutcome, GotoTable};
 use crate::ui::theme::{self, color, icon};
@@ -33,8 +34,22 @@ pub enum Action {
     LoadSchemas(String),
     LoadRelations(String, String),
     NewConsole(String),
-    OpenTable { source: String, schema: String, table: String },
-    ShowDdl { source: String, schema: String, table: String },
+    OpenTable {
+        source: String,
+        schema: String,
+        table: String,
+    },
+    /// Schema diagram, optionally centred on a table.
+    OpenDiagram {
+        source: String,
+        schema: String,
+        focus: Option<String>,
+    },
+    ShowDdl {
+        source: String,
+        schema: String,
+        table: String,
+    },
 }
 
 const HISTORY_LIMIT: usize = 200;
@@ -154,7 +169,9 @@ impl App {
             let mut c = Console::new(id, tab.source.clone(), tab.title.clone(), dialect, tab.sql.clone());
             c.file = tab.file.clone();
             c.saved_text = tab.saved_text.clone();
-            if let Some(t) = &tab.table {
+            if let Some(schema) = &tab.diagram {
+                c.diagram = Some(Diagram::new(schema.clone(), None));
+            } else if let Some(t) = &tab.table {
                 let mut view = TableView::new(t.schema.clone(), t.table.clone(), t.filters.clone(), t.order.clone());
                 view.mode = match t.mode.as_str() {
                     "structure" => ViewMode::Structure,
@@ -185,6 +202,7 @@ impl App {
                 sql: c.sql.clone(),
                 file: c.file.clone(),
                 saved_text: c.saved_text.clone(),
+                diagram: c.diagram.as_ref().map(|d| d.schema.clone()),
                 table: c.table.as_ref().map(|t| persist::SessionTable {
                     schema: t.schema.clone(),
                     table: t.table.clone(),
@@ -583,6 +601,28 @@ impl App {
         entries.truncate(HISTORY_LIMIT);
     }
 
+    /// Opens the schema's diagram tab, reusing an open one.
+    fn open_diagram(&mut self, source: String, schema: String, focus: Option<String>) {
+        let existing =
+            self.tabs.iter().position(|c| c.source == source && c.diagram.as_ref().is_some_and(|d| d.schema == schema));
+        let i = match existing {
+            Some(i) => i,
+            None => {
+                let Some(id) = self.new_console(&source, Some(format!("{schema} diagram")), String::new()) else {
+                    return;
+                };
+                let Some(i) = self.tabs.iter().position(|c| c.id == id) else { return };
+                self.tabs[i].diagram = Some(Diagram::new(schema.clone(), None));
+                i
+            }
+        };
+        self.activate(i);
+        if let Some(d) = &mut self.tabs[i].diagram {
+            d.focus = focus;
+        }
+        self.schema_choice.insert(source, schema);
+    }
+
     /// Opens a table's tab in `mode`, reusing an open one.
     fn open_table(&mut self, source: String, schema: String, table: String, mode: ViewMode) {
         let existing = self.tabs.iter().position(|c| {
@@ -879,6 +919,7 @@ impl App {
                 self.new_console(&source, None, String::new());
             }
             Action::OpenTable { source, schema, table } => self.open_table(source, schema, table, ViewMode::Content),
+            Action::OpenDiagram { source, schema, focus } => self.open_diagram(source, schema, focus),
             Action::ShowDdl { source, schema, table } => self.open_table(source, schema, table, ViewMode::Sql),
         }
     }
@@ -973,6 +1014,11 @@ impl App {
                 }
             }
             ConsoleAction::OpenFile => self.open_file(),
+            ConsoleAction::OpenTable { schema, table } => {
+                if let Some(source) = self.console_mut(console).map(|c| c.source.clone()) {
+                    self.open_table(source, schema, table, ViewMode::Content);
+                }
+            }
             ConsoleAction::Commit | ConsoleAction::Rollback => {
                 let sql = if matches!(action, ConsoleAction::Commit) { "COMMIT" } else { "ROLLBACK" };
                 if let Some(conn) = self.worker.console_connection(console)
@@ -1215,7 +1261,13 @@ fn tab_button(
     tag: Option<(Color32, Color32)>,
     read_only: bool,
 ) -> TabClick {
-    let glyph = if c.table.is_some() { icon::TABLE } else { icon::TERMINAL_WINDOW };
+    let glyph = if c.diagram.is_some() {
+        icon::TREE_STRUCTURE
+    } else if c.table.is_some() {
+        icon::TABLE
+    } else {
+        icon::TERMINAL_WINDOW
+    };
     let mut click = TabClick::None;
     let fill = match (tag, active) {
         (Some((_, tint)), true) => tint,
@@ -1290,7 +1342,10 @@ impl App {
                 }
                 None => {
                     let source = self.source(&c.source).map(|s| s.name.clone()).unwrap_or_default();
-                    format!("{} — {source}", c.title)
+                    match &c.diagram {
+                        Some(d) => format!("Diagram {} — {source}", d.schema),
+                        None => format!("{} — {source}", c.title),
+                    }
                 }
             },
             None => "Database Manager".into(),
