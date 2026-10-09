@@ -1,0 +1,10 @@
+[package]
+name = "dbm-driver-oracle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dbm-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+oracle = "0.6"

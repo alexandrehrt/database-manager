@@ -7,6 +7,7 @@ use eframe::egui;
 enum Engine {
     Postgres,
     Sqlite,
+    Oracle,
 }
 
 pub enum TestState {
@@ -27,6 +28,9 @@ pub struct DataSourceDialog {
     save_password: bool,
     ssl_mode: SslMode,
     path: String,
+    service: String,
+    /// Oracle Instant Client folder; empty means the system library path.
+    client_dir: String,
     pub test: Option<TestState>,
     error: Option<String>,
 }
@@ -52,6 +56,8 @@ impl DataSourceDialog {
             save_password: true,
             ssl_mode: SslMode::Prefer,
             path: String::new(),
+            service: "FREEPDB1".into(),
+            client_dir: String::new(),
             test: None,
             error: None,
         }
@@ -73,6 +79,14 @@ impl DataSourceDialog {
             DataSourceKind::Sqlite { path } => {
                 d.engine = Engine::Sqlite;
                 d.path = path.display().to_string();
+            }
+            DataSourceKind::Oracle { host, port, service, user, client_dir } => {
+                d.engine = Engine::Oracle;
+                d.host = host.clone();
+                d.port = port.to_string();
+                d.service = service.clone();
+                d.user = user.clone();
+                d.client_dir = client_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
             }
         }
         d
@@ -102,6 +116,18 @@ impl DataSourceDialog {
                 }
                 DataSourceKind::Sqlite { path: PathBuf::from(self.path.trim()) }
             }
+            Engine::Oracle => {
+                if self.host.trim().is_empty() || self.service.trim().is_empty() {
+                    return Err("Host and service name are required".into());
+                }
+                DataSourceKind::Oracle {
+                    host: self.host.trim().to_string(),
+                    port: self.port.trim().parse().map_err(|_| "Port must be a number between 1 and 65535")?,
+                    service: self.service.trim().to_string(),
+                    user: self.user.trim().to_string(),
+                    client_dir: Some(self.client_dir.trim()).filter(|d| !d.is_empty()).map(PathBuf::from),
+                }
+            }
         };
         let name = match self.name.trim() {
             "" => default_name(&kind),
@@ -125,14 +151,20 @@ impl DataSourceDialog {
 
                 ui.label("Type");
                 ui.horizontal(|ui| {
+                    let before = self.engine;
                     ui.selectable_value(&mut self.engine, Engine::Postgres, "PostgreSQL");
                     ui.selectable_value(&mut self.engine, Engine::Sqlite, "SQLite");
+                    ui.selectable_value(&mut self.engine, Engine::Oracle, "Oracle");
+                    if self.engine != before {
+                        self.switch_defaults(before);
+                    }
                 });
                 ui.end_row();
 
                 match self.engine {
                     Engine::Postgres => self.postgres_fields(ui),
                     Engine::Sqlite => self.sqlite_fields(ui),
+                    Engine::Oracle => self.oracle_fields(ui),
                 }
             });
 
@@ -232,6 +264,80 @@ impl DataSourceDialog {
         ui.end_row();
     }
 
+    /// Swaps the port and user defaults when they still hold the previous engine's.
+    fn switch_defaults(&mut self, from: Engine) {
+        let (old_port, old_user) = match from {
+            Engine::Postgres => ("5432", "postgres"),
+            Engine::Oracle => ("1521", ""),
+            Engine::Sqlite => return,
+        };
+        let (new_port, new_user) = match self.engine {
+            Engine::Postgres => ("5432", "postgres"),
+            Engine::Oracle => ("1521", ""),
+            Engine::Sqlite => return,
+        };
+        if self.port == old_port {
+            self.port = new_port.into();
+        }
+        if self.user == old_user {
+            self.user = new_user.into();
+        }
+    }
+
+    fn oracle_fields(&mut self, ui: &mut egui::Ui) {
+        ui.label("Host");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(260.0));
+            ui.label("Port");
+            ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(f32::INFINITY));
+        });
+        ui.end_row();
+
+        ui.label("Service name");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.service)
+                .hint_text("e.g. FREEPDB1, ORCLPDB1")
+                .desired_width(f32::INFINITY),
+        );
+        ui.end_row();
+
+        ui.label("User");
+        ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(f32::INFINITY));
+        ui.end_row();
+
+        ui.label("Password");
+        let hint = if self.editing.is_some() { "leave empty to keep the saved password" } else { "" };
+        ui.add(
+            egui::TextEdit::singleline(&mut self.password).password(true).hint_text(hint).desired_width(f32::INFINITY),
+        );
+        ui.end_row();
+
+        ui.label("");
+        ui.checkbox(&mut self.save_password, "Save password in Keychain");
+        ui.end_row();
+
+        ui.label("Instant Client");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.client_dir)
+                    .hint_text("folder, if not on the library path")
+                    .desired_width(260.0),
+            );
+            if ui.button("Browse…").clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                self.client_dir = dir.display().to_string();
+            }
+        });
+        ui.end_row();
+        ui.label("");
+        ui.hyperlink_to(
+            "Download Oracle Instant Client (Basic)",
+            "https://www.oracle.com/database/technologies/instant-client/downloads.html",
+        );
+        ui.end_row();
+    }
+
     fn sqlite_fields(&mut self, ui: &mut egui::Ui) {
         ui.label("File");
         ui.horizontal(|ui| {
@@ -259,6 +365,7 @@ impl DataSourceDialog {
 fn default_name(kind: &DataSourceKind) -> String {
     match kind {
         DataSourceKind::Postgres { host, database, .. } => format!("{database}@{host}"),
+        DataSourceKind::Oracle { host, service, user, .. } => format!("{user}@{host}/{service}"),
         DataSourceKind::Sqlite { path } => {
             path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned())
         }

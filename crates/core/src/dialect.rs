@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum Dialect {
     Postgres,
     Sqlite,
+    Oracle,
 }
 
 impl Dialect {
@@ -21,6 +22,7 @@ impl Dialect {
         match self {
             Dialect::Postgres => format!("${n}"),
             Dialect::Sqlite => format!("?{n}"),
+            Dialect::Oracle => format!(":{n}"),
         }
     }
 

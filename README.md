@@ -1,6 +1,6 @@
 # database-manager
 
-A desktop database client written in Rust, modelled on DataGrip's feature set. It supports PostgreSQL and SQLite and uses an [egui](https://github.com/emilk/egui) interface. It also has DBeaver-style foreign-key navigation in the results grid.
+A desktop database client written in Rust, modelled on DataGrip's feature set. It supports PostgreSQL, SQLite and Oracle and uses an [egui](https://github.com/emilk/egui) interface. It also has DBeaver-style foreign-key navigation in the results grid.
 
 Work was tracked in the [v1](https://github.com/alexandrehrt/database-manager/issues/8) and [v2](https://github.com/alexandrehrt/database-manager/issues/24) epics. [docs/parity.md](docs/parity.md) lists which DataGrip features exist and which don't.
 
@@ -26,6 +26,26 @@ docker exec -i dbm-pg psql -U postgres < fixtures/seed.sql
 ```
 
 Then use **File → New data source…** to add them. For the SQLite database, pick `seed.db`. For Postgres, use host `localhost`, port `54329`, user `postgres` and password `pw`.
+
+## Oracle
+
+Oracle connections need **Oracle Instant Client** (the free Basic package) from
+[oracle.com](https://www.oracle.com/database/technologies/instant-client/downloads.html). Either put it on the system
+library path, or set its folder in the connection's **Instant Client** field. It is loaded once per run, so restart
+the app after changing that folder.
+
+To try it locally, run Oracle Free in Docker and load the Oracle version of the sample data:
+
+```sh
+docker run -d --name dbm-oracle -p 1521:1521 -e ORACLE_PASSWORD=pw -e APP_USER=dbm -e APP_USER_PASSWORD=pw gvenzl/oracle-free:23-slim
+docker exec -i dbm-oracle sqlplus -s dbm/pw@FREEPDB1 < fixtures/seed-oracle.sql
+```
+
+Then add a connection with host `localhost`, port `1521`, service name `FREEPDB1`, user `dbm`, password `pw`.
+
+Oracle doesn't report which table a result column comes from, so FK links and grid editing work for single-table
+queries (`SELECT * | columns FROM table [WHERE …] [ORDER BY …]`), which covers table tabs and FK navigation. In a
+console, PL/SQL blocks end with a line holding only `/`, as in SQL*Plus.
 
 ## Using it
 

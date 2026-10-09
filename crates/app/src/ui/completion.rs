@@ -237,7 +237,15 @@ fn insert_ident(dialect: Dialect, name: &str) -> String {
     let plain = name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && !KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(name));
-    if plain || (dialect == Dialect::Sqlite && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+    // Oracle folds unquoted names to upper case, so upper-case names need no quotes.
+    let oracle_plain = dialect == Dialect::Oracle
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '_' | '$' | '#'))
+        && !KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(name));
+    if plain
+        || oracle_plain
+        || (dialect == Dialect::Sqlite && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
         name.to_string()
     } else {
         dialect.quote_ident(name)

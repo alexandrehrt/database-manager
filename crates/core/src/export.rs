@@ -96,6 +96,7 @@ pub fn sql_literal(dialect: Dialect, v: &Value) -> String {
             match dialect {
                 Dialect::Postgres => format!("'\\x{hex}'"),
                 Dialect::Sqlite => format!("X'{hex}'"),
+                Dialect::Oracle => format!("HEXTORAW('{hex}')"),
             }
         }
         other => quoted(&other.to_string()),

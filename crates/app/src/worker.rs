@@ -305,8 +305,30 @@ async fn apply_edits(
     Ok(())
 }
 
+/// The given password, else the one saved in the keychain.
+async fn password_for(config: &DataSourceConfig, password: Option<String>) -> DbResult<Option<String>> {
+    if password.is_some() {
+        return Ok(password);
+    }
+    let id = config.id.clone();
+    tokio::task::spawn_blocking(move || persist::load_password(&id)).await.map_err(|e| DbError::new(e.to_string()))
+}
+
 async fn open(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
     match &config.kind {
+        DataSourceKind::Oracle { host, port, service, user, client_dir } => {
+            let password = password_for(config, password).await?;
+            let conn = dbm_driver_oracle::connect(dbm_driver_oracle::OracleParams {
+                host,
+                port: *port,
+                service,
+                user,
+                password: password.as_deref(),
+                client_dir: client_dir.as_deref(),
+            })
+            .await?;
+            Ok(Arc::new(conn))
+        }
         DataSourceKind::Sqlite { path } => Ok(Arc::new(dbm_driver_sqlite::connect(path).await?)),
         DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
             let password = match password {

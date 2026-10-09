@@ -879,9 +879,11 @@ impl eframe::App for App {
             self.load_all_tables();
         }
         let catalog_tables = active_source.as_deref().map(|s| self.source_tables(s)).unwrap_or_default();
-        let default_schema = match active_source.as_deref().and_then(|s| self.source(s)).map(|s| s.kind.dialect()) {
-            Some(dbm_core::Dialect::Sqlite) => "main",
-            _ => "public",
+        // Schema that unqualified names resolve to: Oracle uses the user's own schema.
+        let default_schema = match active_source.as_deref().and_then(|s| self.source(s)).map(|s| &s.kind) {
+            Some(dbm_core::config::DataSourceKind::Sqlite { .. }) => "main".to_string(),
+            Some(dbm_core::config::DataSourceKind::Oracle { user, .. }) => user.to_uppercase(),
+            _ => "public".to_string(),
         };
         let no_fks = ForeignKeyIndex::new();
         let no_tables = HashMap::new();
@@ -931,7 +933,11 @@ impl eframe::App for App {
             };
             let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
             let tables = self.table_cache.get(&c.source).unwrap_or(&no_tables);
-            let catalog = crate::ui::completion::Catalog { tables: &catalog_tables, details: tables, default_schema };
+            let catalog = crate::ui::completion::Catalog {
+                tables: &catalog_tables,
+                details: tables,
+                default_schema: &default_schema,
+            };
             let cx = ConsoleContext {
                 history,
                 fks: self.fk_cache.get(&c.source).unwrap_or(&no_fks),

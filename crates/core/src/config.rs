@@ -27,6 +27,16 @@ pub enum DataSourceKind {
     Sqlite {
         path: PathBuf,
     },
+    /// Needs Oracle Instant Client; `client_dir` points at it when it isn't
+    /// on the system library path.
+    Oracle {
+        host: String,
+        port: u16,
+        service: String,
+        user: String,
+        #[serde(default)]
+        client_dir: Option<PathBuf>,
+    },
 }
 
 impl DataSourceKind {
@@ -34,6 +44,7 @@ impl DataSourceKind {
         match self {
             DataSourceKind::Postgres { .. } => Dialect::Postgres,
             DataSourceKind::Sqlite { .. } => Dialect::Sqlite,
+            DataSourceKind::Oracle { .. } => Dialect::Oracle,
         }
     }
 }
