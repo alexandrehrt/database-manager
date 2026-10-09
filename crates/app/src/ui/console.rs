@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use dbm_core::driver::is_read_only_query;
-use dbm_core::statement_at::statement_at;
 use dbm_core::fk_nav::{FkLink, ForeignKeyIndex, link_for_cell};
+use dbm_core::statement_at::statement_at;
 use dbm_core::{DbError, Dialect, ExecOutcome, Value, sql_split};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
@@ -120,7 +120,8 @@ impl Console {
                     {
                         action = self.run_at_cursor(ui, editor_id);
                     }
-                    if ui.add_enabled(!running, egui::Button::new("Run all")).on_hover_text("Cmd+Shift+Enter").clicked() {
+                    if ui.add_enabled(!running, egui::Button::new("Run all")).on_hover_text("Cmd+Shift+Enter").clicked()
+                    {
                         action = self.run_all();
                     }
                     if ui.add_enabled(running, egui::Button::new("Cancel")).clicked() {
@@ -162,18 +163,21 @@ impl Console {
                     let job = sql_highlight::layout(ui, text.as_str(), wrap_width);
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
-                egui::ScrollArea::vertical().id_salt(("editor-scroll", self.id)).auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add_sized(
-                        ui.available_size(),
-                        egui::TextEdit::multiline(&mut self.sql)
-                            .id(editor_id)
-                            .code_editor()
-                            .lock_focus(true)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Write SQL here. Cmd+Enter runs the statement under the cursor.")
-                            .layouter(&mut layouter),
-                    );
-                });
+                egui::ScrollArea::vertical().id_salt(("editor-scroll", self.id)).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut self.sql)
+                                .id(editor_id)
+                                .code_editor()
+                                .lock_focus(true)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Write SQL here. Cmd+Enter runs the statement under the cursor.")
+                                .layouter(&mut layouter),
+                        );
+                    },
+                );
             });
 
         if self.run.is_none() {
@@ -347,8 +351,7 @@ fn run_fresh(statements: Vec<String>) -> Option<ConsoleAction> {
 fn navigate(dialect: Dialect, from: usize, link: &FkLink) -> ConsoleAction {
     let (sql, params) = dbm_core::fk_nav::navigation_query(dialect, link);
     let fk = &link.foreign_key;
-    let key: Vec<String> =
-        fk.ref_columns.iter().zip(&link.values).map(|(c, v)| format!("{c} = {v}")).collect();
+    let key: Vec<String> = fk.ref_columns.iter().zip(&link.values).map(|(c, v)| format!("{c} = {v}")).collect();
     ConsoleAction::Run {
         statements: vec![(sql, params)],
         limit: PAGE_SIZE,
@@ -357,7 +360,10 @@ fn navigate(dialect: Dialect, from: usize, link: &FkLink) -> ConsoleAction {
 }
 
 fn export(rs: &dbm_core::ResultSet, format: &str) {
-    let Some(path) = rfd::FileDialog::new().add_filter(format.to_uppercase(), &[format]).set_file_name(format!("result.{format}")).save_file()
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter(format.to_uppercase(), &[format])
+        .set_file_name(format!("result.{format}"))
+        .save_file()
     else {
         return;
     };
@@ -366,6 +372,10 @@ fn export(rs: &dbm_core::ResultSet, format: &str) {
         _ => serde_json::to_writer_pretty(file, &dbm_core::export::to_json(rs)).map_err(|e| e.to_string()),
     });
     if let Err(e) = result {
-        rfd::MessageDialog::new().set_title("Export failed").set_description(e).set_level(rfd::MessageLevel::Error).show();
+        rfd::MessageDialog::new()
+            .set_title("Export failed")
+            .set_description(e)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
     }
 }

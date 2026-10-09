@@ -69,7 +69,11 @@ fn decode_known(ty: &Type, raw: &[u8]) -> Option<Value> {
             let ts = get::<DateTime<Utc>>(ty, raw)?;
             Some(Value::Text(format!("{}+00", trim_fraction(&ts.format("%Y-%m-%d %H:%M:%S%.f").to_string()))))
         })?,
-        Type::POINT => Value::Text(format!("({},{})", f64::from_be_bytes(raw.get(0..8)?.try_into().ok()?), f64::from_be_bytes(raw.get(8..16)?.try_into().ok()?))),
+        Type::POINT => Value::Text(format!(
+            "({},{})",
+            f64::from_be_bytes(raw.get(0..8)?.try_into().ok()?),
+            f64::from_be_bytes(raw.get(8..16)?.try_into().ok()?)
+        )),
         Type::INTERVAL => interval(raw)?,
         Type::INET | Type::CIDR => inet(raw)?,
         _ => match ty.kind() {

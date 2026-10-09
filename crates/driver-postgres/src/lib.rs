@@ -142,9 +142,7 @@ impl PgConnection {
             .map_err(pg_err)?;
         let lookup: std::collections::HashMap<(u32, i16), ColumnOrigin> = rows
             .iter()
-            .map(|r| {
-                ((r.get(0), r.get(1)), ColumnOrigin { schema: r.get(2), table: r.get(3), column: r.get(4) })
-            })
+            .map(|r| ((r.get(0), r.get(1)), ColumnOrigin { schema: r.get(2), table: r.get(3), column: r.get(4) }))
             .collect();
         Ok(keys.into_iter().map(|k| k.and_then(|k| lookup.get(&k).cloned())).collect())
     }

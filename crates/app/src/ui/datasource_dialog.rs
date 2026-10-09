@@ -214,7 +214,9 @@ impl DataSourceDialog {
 
         ui.label("Password");
         let hint = if self.editing.is_some() { "leave empty to keep the saved password" } else { "" };
-        ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text(hint).desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.password).password(true).hint_text(hint).desired_width(f32::INFINITY),
+        );
         ui.end_row();
 
         ui.label("");

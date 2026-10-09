@@ -28,9 +28,7 @@ pub fn to_json(rs: &ResultSet) -> serde_json::Value {
     }
     rs.rows
         .iter()
-        .map(|row| {
-            keys.iter().cloned().zip(row.iter().map(value_to_json)).collect::<serde_json::Map<_, _>>().into()
-        })
+        .map(|row| keys.iter().cloned().zip(row.iter().map(value_to_json)).collect::<serde_json::Map<_, _>>().into())
         .collect::<Vec<serde_json::Value>>()
         .into()
 }

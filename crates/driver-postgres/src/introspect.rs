@@ -1,8 +1,6 @@
 //! Catalog queries against `pg_catalog`.
 
-use dbm_core::{
-    ColumnInfo, DbError, DbResult, Dialect, ForeignKey, IndexInfo, Relation, RelationKind, TableDetails,
-};
+use dbm_core::{ColumnInfo, DbError, DbResult, Dialect, ForeignKey, IndexInfo, Relation, RelationKind, TableDetails};
 use tokio_postgres::Client;
 
 use crate::pg_err;
