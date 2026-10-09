@@ -204,6 +204,40 @@ struct FindBar {
     reveal: bool,
 }
 
+/// A run waiting for parameter values.
+struct ParamPrompt {
+    action: ConsoleAction,
+    names: Vec<String>,
+    focus: bool,
+}
+
+/// A parameter's value as typed, and whether it is an SQL expression rather
+/// than a value to quote.
+#[derive(Clone, Default)]
+struct ParamValue {
+    text: String,
+    expression: bool,
+}
+
+impl ParamValue {
+    /// SQL text for the value: numbers, NULL, booleans and already-quoted text
+    /// as typed, anything else as a string literal.
+    fn sql(&self, dialect: Dialect) -> String {
+        let t = self.text.trim();
+        let number = !t.is_empty()
+            && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+            && t.parse::<f64>().is_ok();
+        let quoted = t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'');
+        if self.expression || number || quoted {
+            t.to_string()
+        } else if ["null", "true", "false"].iter().any(|k| t.eq_ignore_ascii_case(k)) {
+            t.to_ascii_uppercase()
+        } else {
+            dbm_core::export::sql_literal(dialect, &Value::Text(self.text.clone()))
+        }
+    }
+}
+
 /// Field buffers of the row panel, for the row they were filled from.
 struct RowPanel {
     tab: usize,
@@ -247,6 +281,9 @@ pub struct Console {
     find: Option<FindBar>,
     /// A run held for confirmation: UPDATE / DELETE statements without WHERE.
     unrestricted: Option<(ConsoleAction, Vec<(String, &'static str)>)>,
+    param_prompt: Option<ParamPrompt>,
+    /// Last values typed for each parameter name.
+    param_values: HashMap<String, ParamValue>,
     /// Put the editor cursor at this byte offset next frame (an error position).
     jump_to: Option<usize>,
     /// Scroll the editor to this byte offset once it is drawn.
@@ -326,6 +363,8 @@ impl Console {
             save_requested: false,
             find: None,
             unrestricted: None,
+            param_prompt: None,
+            param_values: HashMap::new(),
             jump_to: None,
             reveal_byte: None,
             auto_closers: Vec::new(),
@@ -407,6 +446,7 @@ impl Console {
         let (save_as, save) = ui.input_mut(|i| (i.consume_shortcut(&SAVE_AS), i.consume_shortcut(&SAVE)));
         self.save_requested = save;
         let action = self.show_inner(ui, cx);
+        let action = self.hold_params(action).or_else(|| self.params_modal(ui));
         let action = self.block_writes(action, cx.read_only);
         let action = self.hold_unrestricted(action).or_else(|| self.unrestricted_modal(ui));
         // Cmd+S not taken by pending grid edits saves the file.
@@ -1977,6 +2017,95 @@ impl Console {
     }
 
     /// Holds `action` behind a confirmation when it would discard pending edits.
+    /// Holds a run from the editor whose statements have placeholders until
+    /// their values are entered.
+    fn hold_params(&mut self, action: Option<ConsoleAction>) -> Option<ConsoleAction> {
+        let a = action?;
+        let ConsoleAction::Run { statements, mode: RunMode::Fresh, .. } = &a else { return Some(a) };
+        let mut names: Vec<String> = Vec::new();
+        for (sql, _) in statements {
+            for p in sql_format::parameters(sql, self.dialect) {
+                if !names.contains(&p.name) {
+                    names.push(p.name);
+                }
+            }
+        }
+        if names.is_empty() {
+            return Some(a);
+        }
+        self.param_prompt = Some(ParamPrompt { action: a, names, focus: true });
+        None
+    }
+
+    fn params_modal(&mut self, ui: &egui::Ui) -> Option<ConsoleAction> {
+        let prompt = self.param_prompt.as_mut()?;
+        let mut decision = None;
+        let modal = egui::Modal::new(egui::Id::new(("params", self.id))).show(ui.ctx(), |ui| {
+            ui.set_width(440.0);
+            ui.heading("Query parameters");
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Numbers, NULL and true / false are used as typed; other text is quoted. Tick SQL to insert an expression such as now().")
+                    .small()
+                    .color(color::TEXT_WEAK),
+            );
+            ui.add_space(8.0);
+            egui::Grid::new(("params-grid", self.id)).num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+                for (i, name) in prompt.names.iter().enumerate() {
+                    let value = self.param_values.entry(name.clone()).or_default();
+                    ui.label(RichText::new(name).font(theme::mono(12.5)));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut value.text)
+                            .font(theme::mono(12.5))
+                            .desired_width(280.0)
+                            .hint_text("value"),
+                    );
+                    if i == 0 && std::mem::take(&mut prompt.focus) {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        decision = Some(true);
+                    }
+                    ui.checkbox(&mut value.expression, "SQL").on_hover_text("Insert the text as an SQL expression");
+                    ui.end_row();
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button(format!("{}  Run", icon::PLAY))).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        });
+        if decision.is_none() && modal.should_close() {
+            decision = Some(false);
+        }
+        let proceed = decision?;
+        let prompt = self.param_prompt.take()?;
+        if !proceed || self.run.is_some() {
+            return None;
+        }
+        let ConsoleAction::Run { statements, limit, mode } = prompt.action else { return None };
+        let dialect = self.dialect;
+        let values = &self.param_values;
+        let statements = statements
+            .into_iter()
+            .map(|(sql, params)| {
+                let found = sql_format::parameters(&sql, dialect);
+                let text = sql_format::substitute(&sql, &found, |name| {
+                    values.get(name).map_or_else(|| "NULL".to_string(), |v| v.sql(dialect))
+                });
+                (text, params)
+            })
+            .collect();
+        Some(ConsoleAction::Run { statements, limit, mode })
+    }
+
     /// On a read-only connection, refuses runs with statements that may write.
     fn block_writes(&mut self, action: Option<ConsoleAction>, read_only: bool) -> Option<ConsoleAction> {
         let a = action?;

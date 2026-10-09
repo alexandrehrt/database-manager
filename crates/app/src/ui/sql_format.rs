@@ -549,3 +549,59 @@ pub fn unrestricted_write(sql: &str) -> Option<(String, &'static str)> {
     head.push(name);
     Some((head.join(" "), reason))
 }
+
+/// A placeholder in a statement: its byte range and the name it is asked by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub range: std::ops::Range<usize>,
+    pub name: String,
+}
+
+/// Placeholders to prompt for: `:name` on every engine, `$1` on Postgres and
+/// `?` / `?1` on SQLite. Strings, comments and dollar bodies are skipped, and
+/// so are procedural blocks, where `:new` and friends mean something else.
+pub fn parameters(sql: &str, dialect: dbm_core::Dialect) -> Vec<Param> {
+    use dbm_core::Dialect;
+    let toks = tokenize(sql);
+    let plain: Vec<Tok<'_>> = toks.iter().map(|(t, _)| t.clone()).collect();
+    if is_procedural(&plain) {
+        return Vec::new();
+    }
+    let offset = |s: &str| s.as_ptr() as usize - sql.as_ptr() as usize;
+    let mut bare = 0;
+    let mut out = Vec::new();
+    for (tok, _) in toks {
+        let (text, name) = match tok {
+            Tok::Verbatim(v) if v.starts_with(':') && v[1..].starts_with(|c: char| c.is_alphabetic() || c == '_') => {
+                (v, v[1..].to_string())
+            }
+            Tok::Verbatim(v)
+                if dialect == Dialect::Postgres && v.starts_with('$') && v[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                (v, v.to_string())
+            }
+            Tok::Verbatim(v)
+                if dialect == Dialect::Sqlite && v.starts_with('?') && v[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                (v, v.to_string())
+            }
+            Tok::Punct(q) if q == "?" && dialect == Dialect::Sqlite => {
+                bare += 1;
+                (q, format!("?{bare}"))
+            }
+            _ => continue,
+        };
+        let start = offset(text);
+        out.push(Param { range: start..start + text.len(), name });
+    }
+    out
+}
+
+/// `sql` with each parameter replaced by its SQL text from `value`.
+pub fn substitute(sql: &str, params: &[Param], value: impl Fn(&str) -> String) -> String {
+    let mut out = sql.to_string();
+    for p in params.iter().rev() {
+        out.replace_range(p.range.clone(), &value(&p.name));
+    }
+    out
+}
