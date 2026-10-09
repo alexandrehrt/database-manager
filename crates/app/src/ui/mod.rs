@@ -6,3 +6,4 @@ pub mod explorer;
 pub mod goto;
 pub mod grid;
 pub mod sql_highlight;
+pub mod theme;

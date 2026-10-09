@@ -1,6 +1,8 @@
-//! A query console: SQL editor on top, one results tab per executed
-//! statement below.
+//! A query console: SQL editor on top, results below with a status bar and
+//! a row panel. Consoles opened on a table's data also have Structure and
+//! SQL (DDL) views.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -8,20 +10,20 @@ use std::time::{Duration, Instant};
 use dbm_core::driver::is_read_only_query;
 use dbm_core::fk_nav::{FkLink, ForeignKeyIndex, link_for_cell, referencing_query, referencing_values};
 use dbm_core::statement_at::statement_at;
-use std::collections::HashMap;
-
-use dbm_core::{DbError, Dialect, ExecOutcome, IncomingKey, TableDetails, Value, sql_split};
-use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
+use dbm_core::{DbError, Dialect, ExecOutcome, IncomingKey, ResultSet, TableDetails, Value, sql_split};
+use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, Stroke};
 
 use crate::ui::completion::{self, Catalog, Item};
-use crate::ui::edits::{self, EditStatement, Edits};
-use crate::ui::grid::{self, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
+use crate::ui::edits::{self, EditStatement, EditTarget, Edits, RowRef};
+use crate::ui::grid::{self, ColumnMeta, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
 use crate::ui::sql_highlight;
+use crate::ui::theme::{self, color, icon};
 
 pub const PAGE_SIZE: usize = 500;
 
 const RUN_STATEMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const RUN_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Enter);
+const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 
 /// SQL plus its bound parameters.
 pub type Statement = (String, Vec<Value>);
@@ -97,29 +99,53 @@ pub enum TxMode {
     Manual,
 }
 
-/// Filter and sort applied server-side to a console opened on a table's data.
+/// What a table tab shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Content,
+    Structure,
+    Sql,
+}
+
+/// Filters and sort applied server-side to a console opened on a table's data.
 pub struct TableView {
     pub schema: String,
     pub table: String,
-    pub filter: String,
+    /// WHERE conditions, combined with AND; each is a chip.
+    pub filters: Vec<String>,
     pub order: String,
-    /// Column sorted by a header click and its direction; `None` once the
-    /// ORDER BY text is edited by hand.
+    /// Column sorted by a header click and its direction.
     pub sort: Option<(usize, bool)>,
     /// Error of the last filter run; the previous rows stay visible.
     pub error: Option<String>,
+    pub mode: ViewMode,
+    /// The table's DDL once loaded.
+    pub ddl: Option<Result<String, String>>,
+    /// Text of the filter being typed, while the "+ Filter" field is open.
+    new_filter: Option<String>,
 }
 
 impl TableView {
-    pub fn new(schema: String, table: String, filter: String, order: String) -> Self {
-        Self { schema, table, filter, order, sort: None, error: None }
+    pub fn new(schema: String, table: String, filters: Vec<String>, order: String) -> Self {
+        Self {
+            schema,
+            table,
+            filters,
+            order,
+            sort: None,
+            error: None,
+            mode: ViewMode::Content,
+            ddl: None,
+            new_filter: None,
+        }
     }
 
     /// Clauses go on their own lines so a `--` comment in one can't swallow the next.
     pub fn sql(&self, dialect: Dialect) -> String {
         let mut sql = dialect.select_all(&self.schema, &self.table);
-        if !self.filter.trim().is_empty() {
-            sql.push_str(&format!("\nWHERE {}", self.filter.trim()));
+        let conditions: Vec<&str> = self.filters.iter().map(|f| f.trim()).filter(|f| !f.is_empty()).collect();
+        if !conditions.is_empty() {
+            sql.push_str(&format!("\nWHERE {}", conditions.join("\n  AND ")));
         }
         if !self.order.trim().is_empty() {
             sql.push_str(&format!("\nORDER BY {}", self.order.trim()));
@@ -135,6 +161,13 @@ pub struct CompletionPopup {
     /// Byte offset of the word being completed.
     start: usize,
     anchor: egui::Pos2,
+}
+
+/// Field buffers of the row panel, for the row they were filled from.
+struct RowPanel {
+    tab: usize,
+    row: usize,
+    buffers: Vec<String>,
 }
 
 pub struct Console {
@@ -154,15 +187,24 @@ pub struct Console {
     pub in_transaction: bool,
     /// A Commit / Rollback is in flight.
     pub tx_busy: bool,
-    /// Outcome of the last Commit / Rollback, shown in the toolbar.
+    /// Outcome of the last Commit / Rollback, shown in the status bar.
     pub tx_notice: Option<Result<String, String>>,
     /// Set for consoles opened on a table's data.
     pub table: Option<TableView>,
     pub completion: Option<CompletionPopup>,
     /// Recompute completion once metadata arrives (columns were missing).
     completion_waiting: bool,
-    /// Tables whose columns completion needs; the app loads and drains these.
+    /// Tables whose details are needed; the app loads and drains these.
     pub wanted_details: Vec<(String, String)>,
+    /// The SQL view needs the table's DDL; the app loads it.
+    pub wanted_ddl: bool,
+    editor_collapsed: bool,
+    panel_open: bool,
+    panel: Option<RowPanel>,
+    /// The statements "View SQL" shows.
+    view_sql: Option<String>,
+    /// Rows of the statement under the cursor last frame, for its highlight.
+    statement_rect: Option<egui::Rect>,
 }
 
 pub enum ConsoleAction {
@@ -179,6 +221,15 @@ pub enum ConsoleAction {
         tab: usize,
         statements: Vec<EditStatement>,
     },
+}
+
+/// What a console needs from the app to draw its results.
+pub struct ConsoleContext<'a> {
+    pub history: &'a [String],
+    pub fks: &'a ForeignKeyIndex,
+    pub tables: &'a HashMap<(String, String), TableDetails>,
+    pub incoming: &'a HashMap<(String, String), Vec<IncomingKey>>,
+    pub catalog: &'a Catalog<'a>,
 }
 
 impl Console {
@@ -202,20 +253,55 @@ impl Console {
             completion: None,
             completion_waiting: false,
             wanted_details: Vec::new(),
+            wanted_ddl: false,
+            editor_collapsed: false,
+            panel_open: true,
+            panel: None,
+            view_sql: None,
+            statement_rect: None,
         }
     }
 
-    /// `fks` holds foreign keys of the tables results came from, as far as
-    /// they are loaded; cells covered by one become navigation links.
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        history: &[String],
-        fks: &ForeignKeyIndex,
-        tables: &HashMap<(String, String), TableDetails>,
-        incoming: &HashMap<(String, String), Vec<IncomingKey>>,
-        catalog: &Catalog<'_>,
-    ) -> Option<ConsoleAction> {
+    /// Whether any result tab has unsaved grid edits.
+    pub fn has_pending_edits(&self) -> bool {
+        self.results.iter().any(|t| t.edits.row_count() > 0)
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
+        match self.table.as_ref().map(|t| t.mode) {
+            Some(ViewMode::Structure) => {
+                self.structure_view(ui, cx);
+                return None;
+            }
+            Some(ViewMode::Sql) => {
+                self.ddl_view(ui);
+                return None;
+            }
+            _ => {}
+        }
+        let mut action = self.editor_panel(ui, cx);
+        if self.results.is_empty() {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(color::BG)).show(ui, |ui| {
+                ui.centered_and_justified(|ui| {
+                    let text = if self.run.is_some() { "Running…" } else { "Results appear here." };
+                    ui.label(RichText::new(text).color(color::TEXT_WEAK));
+                });
+            });
+            if let Some(a) = self.status_bar_when_empty(ui) {
+                action = Some(a);
+            }
+            return action;
+        }
+        if let Some(a) = self.results_area(ui, cx) {
+            action = Some(a);
+        }
+        self.view_sql_modal(ui);
+        action
+    }
+
+    // ----- editor -------------------------------------------------------
+
+    fn editor_panel(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
         let mut action = None;
         let editor_id = egui::Id::new(("console-editor", self.id));
         let editor_focused = ui.memory(|m| m.has_focus(editor_id));
@@ -236,7 +322,6 @@ impl Console {
         } else {
             (false, false, false, false)
         };
-        let mut editor_out = None;
         // Consume the shortcuts before the editor sees them, or Enter would insert a newline.
         let (run_one, run_all) = if editor_focused {
             // RUN_ALL first: Cmd+Enter also matches Cmd+Shift+Enter logically.
@@ -247,34 +332,47 @@ impl Console {
         } else {
             (false, false)
         };
+        let mut editor_out = None;
+        let mut marker_run = None;
 
-        egui::Panel::top(egui::Id::new(("console-top", self.id)))
-            .resizable(true)
-            .default_size(220.0)
-            .min_size(80.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let running = self.run.is_some();
+        let panel = egui::Panel::top(egui::Id::new(("console-top", self.id, self.editor_collapsed)))
+            .frame(egui::Frame::new().fill(color::BG).inner_margin(egui::Margin::symmetric(10, 8)));
+        let panel = if self.editor_collapsed {
+            panel.resizable(false)
+        } else {
+            panel.resizable(true).default_size(190.0).min_size(90.0)
+        };
+        panel.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let running = self.run.is_some();
+                let ctx = ui.ctx().clone();
+                let run =
+                    theme::primary_button(format!("{}  Run   {}", icon::PLAY, ctx.format_shortcut(&RUN_STATEMENT)));
+                if ui.add_enabled(!running, run).on_hover_text("Statement at the cursor, or the selection").clicked() {
+                    action = self.run_at_cursor(ui, editor_id);
+                }
+                let all = egui::Button::new(format!("Run all   {}", ctx.format_shortcut(&RUN_ALL)));
+                if ui.add_enabled(!running, all).clicked() {
+                    action = self.run_all();
+                }
+                if running && ui.button(format!("{}  Cancel", icon::STOP)).clicked() {
+                    action = Some(ConsoleAction::Cancel);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let chevron = if self.editor_collapsed { icon::CARET_DOWN } else { icon::CARET_UP };
                     if ui
-                        .add_enabled(!running, egui::Button::new("Run"))
-                        .on_hover_text("Statement at cursor or selection (Cmd+Enter)")
+                        .add(theme::flat_button(chevron))
+                        .on_hover_text(if self.editor_collapsed { "Show editor" } else { "Hide editor" })
                         .clicked()
                     {
-                        action = self.run_at_cursor(ui, editor_id);
+                        self.editor_collapsed = !self.editor_collapsed;
                     }
-                    if ui.add_enabled(!running, egui::Button::new("Run all")).on_hover_text("Cmd+Shift+Enter").clicked()
-                    {
-                        action = self.run_all();
-                    }
-                    if ui.add_enabled(running, egui::Button::new("Cancel")).clicked() {
-                        action = Some(ConsoleAction::Cancel);
-                    }
-                    ui.menu_button("History", |ui| {
-                        if history.is_empty() {
+                    ui.menu_button(format!("{}  History", icon::CLOCK_COUNTER_CLOCKWISE), |ui| {
+                        if cx.history.is_empty() {
                             ui.weak("No queries yet");
                         }
                         egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
-                            for q in history {
+                            for q in cx.history {
                                 let label: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
                                 let label: String = label.chars().take(80).collect();
                                 if ui.button(label).on_hover_text(q).clicked() {
@@ -288,49 +386,52 @@ impl Console {
                             }
                         });
                     });
-                    ui.separator();
-                    self.transaction_controls(ui, &mut action);
-                    if let Some(run) = &self.run {
-                        ui.spinner();
-                        ui.weak(format!(
-                            "Running {}/{} - {:.1} s",
-                            (run.done + 1).min(run.total),
-                            run.total,
-                            run.started.elapsed().as_secs_f32()
-                        ));
-                        ui.ctx().request_repaint_after(Duration::from_millis(100));
-                    }
                 });
-                ui.separator();
-
-                let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let job = sql_highlight::layout(ui, text.as_str(), wrap_width);
-                    ui.fonts_mut(|f| f.layout_job(job))
-                };
-                egui::ScrollArea::vertical().id_salt(("editor-scroll", self.id)).auto_shrink([false, false]).show(
-                    ui,
-                    |ui| {
+            });
+            if self.editor_collapsed {
+                return;
+            }
+            ui.add_space(6.0);
+            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                let job = sql_highlight::layout(ui, text.as_str(), wrap_width);
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
+            egui::ScrollArea::vertical().id_salt(("editor-scroll", self.id)).auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let (gutter, _) = ui.allocate_exact_size(egui::vec2(42.0, 1.0), egui::Sense::hover());
+                        if let Some(rect) = self.statement_rect {
+                            let band =
+                                egui::Rect::from_x_y_ranges(gutter.right()..=ui.max_rect().right(), rect.y_range());
+                            ui.painter().rect_filled(band.expand2(egui::vec2(0.0, 1.0)), 0.0, color::ACCENT_SOFT);
+                        }
                         let output = egui::TextEdit::multiline(&mut self.sql)
                             .id(editor_id)
                             .code_editor()
+                            .frame(egui::Frame::NONE)
                             .lock_focus(true)
                             .desired_width(f32::INFINITY)
                             .min_size(ui.available_size())
                             .hint_text("Write SQL here. Cmd+Enter runs the statement under the cursor.")
                             .layouter(&mut layouter)
                             .show(ui);
+                        let cursor = output.cursor_range.map(|r| r.primary.index.0);
+                        marker_run = self.paint_gutter(ui, gutter, &output.galley, output.galley_pos, cursor);
                         editor_out = Some((
                             output.response.response.changed(),
-                            output.cursor_range.map(|r| r.primary.index.0),
+                            cursor,
                             output.galley.clone(),
                             output.galley_pos,
                         ));
-                    },
-                );
-            });
+                    });
+                },
+            );
+        });
 
         if let Some((changed, Some(cursor), galley, galley_pos)) = editor_out {
-            self.update_completion(ui, editor_id, catalog, (changed, cursor, &galley, galley_pos), manual);
+            self.update_completion(ui, editor_id, cx.catalog, (changed, cursor, &galley, galley_pos), manual);
             if let Some(popup) = &mut self.completion {
                 let last = popup.items.len().saturating_sub(1);
                 if down {
@@ -349,55 +450,83 @@ impl Console {
                 self.accept_completion(ui, editor_id, cursor, i);
             }
         }
-
         if self.run.is_none() {
-            if run_one {
+            if let Some(statement) = marker_run {
+                action = run_fresh(vec![statement]);
+            } else if run_one {
                 action = self.run_at_cursor(ui, editor_id);
             } else if run_all {
                 action = self.run_all();
             }
         }
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(a) = self.results_ui(ui, fks, tables, incoming) {
-                action = Some(a);
-            }
-        });
         action
     }
 
-    fn transaction_controls(&mut self, ui: &mut egui::Ui, action: &mut Option<ConsoleAction>) {
-        ui.label("Tx:");
-        ui.selectable_value(&mut self.tx_mode, TxMode::Auto, "Auto")
-            .on_hover_text("Each statement commits on its own (unless you run BEGIN)");
-        ui.selectable_value(&mut self.tx_mode, TxMode::Manual, "Manual")
-            .on_hover_text("Statements run in a transaction until you Commit or Roll back");
-        let can_end = self.in_transaction && self.run.is_none() && !self.tx_busy;
-        if ui.add_enabled(can_end, egui::Button::new("Commit")).clicked() {
-            *action = Some(ConsoleAction::Commit);
-        }
-        if ui.add_enabled(can_end, egui::Button::new("Rollback")).clicked() {
-            *action = Some(ConsoleAction::Rollback);
-        }
-        if self.in_transaction {
-            ui.label(
-                RichText::new(" TRANSACTION OPEN ")
-                    .small()
-                    .strong()
-                    .color(egui::Color32::BLACK)
-                    .background_color(egui::Color32::from_rgb(240, 190, 60)),
-            )
-            .on_hover_text("Changes made in this console are not visible to others until you commit");
-        }
-        match &self.tx_notice {
-            Some(Ok(msg)) => {
-                ui.weak(msg);
+    /// Line numbers, a ▸ marker at each statement start (click to run it) and
+    /// the highlight of the statement under the cursor. Returns a statement
+    /// whose marker was clicked.
+    fn paint_gutter(
+        &mut self,
+        ui: &egui::Ui,
+        gutter: egui::Rect,
+        galley: &Arc<egui::Galley>,
+        galley_pos: egui::Pos2,
+        cursor_char: Option<usize>,
+    ) -> Option<String> {
+        let painter = ui.painter();
+        let number_font = theme::mono(11.0);
+        let mut line = 1;
+        let mut new_line = true;
+        for placed in &galley.rows {
+            if new_line {
+                let y = galley_pos.y + placed.rect().center().y;
+                painter.text(
+                    egui::pos2(gutter.right() - 8.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    line.to_string(),
+                    number_font.clone(),
+                    color::TEXT_FAINT,
+                );
+                line += 1;
             }
-            Some(Err(e)) => {
-                ui.colored_label(ui.visuals().error_fg_color, e);
-            }
-            None => {}
+            new_line = placed.ends_with_newline;
         }
+
+        let to_char = |byte: usize| self.sql[..byte.min(self.sql.len())].chars().count();
+        let row_y = |char_idx: usize| {
+            let r = galley.pos_from_cursor(egui::text::CCursor::new(char_idx));
+            (galley_pos.y + r.top())..=(galley_pos.y + r.bottom())
+        };
+        let cursor_byte = cursor_char.map(|c| self.sql.char_indices().nth(c).map_or(self.sql.len(), |(b, _)| b));
+        let current = cursor_byte.and_then(|b| statement_at(&self.sql, b, self.dialect));
+        self.statement_rect = current.as_ref().map(|span| {
+            let (a, b) = (row_y(to_char(span.start)), row_y(to_char(span.end)));
+            egui::Rect::from_x_y_ranges(gutter.x_range(), *a.start()..=*b.end())
+        });
+        if let Some(rect) = self.statement_rect {
+            let bar = egui::Rect::from_x_y_ranges(gutter.right() - 2.0..=gutter.right(), rect.y_range());
+            painter.rect_filled(bar, 0.0, color::ACCENT);
+        }
+
+        let mut clicked = None;
+        for span in sql_split::split(&self.sql, self.dialect) {
+            let y = row_y(to_char(span.start));
+            let center = egui::pos2(gutter.left() + 9.0, (*y.start() + *y.end()) / 2.0);
+            let hit = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+            let response = ui.interact(hit, ui.id().with(("run-marker", span.start)), egui::Sense::click());
+            let tint = if response.hovered() { color::ACCENT } else { color::SUCCESS };
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                icon::PLAY,
+                theme::font(9.0, egui::FontFamily::Proportional),
+                tint,
+            );
+            if response.on_hover_text("Run this statement").clicked() {
+                clicked = Some(self.sql[span].to_string());
+            }
+        }
+        clicked
     }
 
     /// Opens, refreshes or closes the completion list after this frame's edit.
@@ -406,7 +535,7 @@ impl Console {
         ui: &egui::Ui,
         editor_id: egui::Id,
         catalog: &Catalog<'_>,
-        (changed, cursor_char, galley, galley_pos): (bool, usize, &std::sync::Arc<egui::Galley>, egui::Pos2),
+        (changed, cursor_char, galley, galley_pos): (bool, usize, &Arc<egui::Galley>, egui::Pos2),
         manual: bool,
     ) {
         if !ui.memory(|m| m.has_focus(editor_id)) {
@@ -466,7 +595,7 @@ impl Console {
                                 .horizontal(|ui| {
                                     let r = ui
                                         .selectable_label(i == popup.selected, RichText::new(&item.label).monospace());
-                                    ui.weak(&item.detail);
+                                    ui.label(RichText::new(&item.detail).color(color::TEXT_WEAK));
                                     r
                                 })
                                 .inner;
@@ -523,6 +652,8 @@ impl Console {
         run_fresh(statements)
     }
 
+    // ----- result tabs and navigation ------------------------------------
+
     /// Switching tabs by hand counts as a navigation step, like following a
     /// link in a browser, so Back returns to the tab that was showing.
     fn select_result(&mut self, i: usize) {
@@ -567,50 +698,16 @@ impl Console {
             self.active_result -= 1;
         }
         self.active_result = self.active_result.min(self.results.len().saturating_sub(1));
+        self.panel = None;
     }
 
-    /// WHERE / ORDER BY fields above table data. Enter in either field applies.
-    fn filter_bar(&mut self, ui: &mut egui::Ui) -> Option<ConsoleAction> {
-        let dialect = self.dialect;
-        let running = self.run.is_some();
-        let tv = self.table.as_mut()?;
-        let mut apply = false;
-        ui.horizontal(|ui| {
-            ui.label("WHERE");
-            let w = ui.add(
-                egui::TextEdit::singleline(&mut tv.filter)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("e.g. vip = true")
-                    .desired_width(ui.available_width() * 0.55),
-            );
-            ui.label("ORDER BY");
-            let o = ui.add(
-                egui::TextEdit::singleline(&mut tv.order)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("e.g. created_at DESC")
-                    .desired_width(ui.available_width() - 130.0),
-            );
-            if o.changed() {
-                tv.sort = None;
-            }
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            apply |= (w.lost_focus() || o.lost_focus()) && enter;
-            apply |= ui.add_enabled(!running, egui::Button::new("Apply")).clicked();
-            if ui.add_enabled(!running, egui::Button::new("Clear")).clicked() {
-                tv.filter.clear();
-                tv.order.clear();
-                tv.sort = None;
-                apply = true;
-            }
-        });
-        if let Some(e) = &tv.error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-        }
-        ui.separator();
-        if !apply || running {
-            return None;
-        }
-        let sql = tv.sql(dialect);
+    fn tab_label(&self, i: usize) -> String {
+        self.results[i].title.clone().unwrap_or_else(|| format!("Result {}", i + 1))
+    }
+
+    fn filter_run(&mut self) -> Option<ConsoleAction> {
+        let tv = self.table.as_ref()?;
+        let sql = tv.sql(self.dialect);
         self.sql = sql.clone();
         Some(ConsoleAction::Run { statements: vec![(sql, Vec::new())], limit: PAGE_SIZE, mode: RunMode::Filter })
     }
@@ -628,244 +725,868 @@ impl Console {
             Some((_, asc)) => format!("{} {}", dialect.quote_ident(name), if asc { "ASC" } else { "DESC" }),
             None => String::new(),
         };
-        let sql = tv.sql(dialect);
-        self.sql = sql.clone();
-        Some(ConsoleAction::Run { statements: vec![(sql, Vec::new())], limit: PAGE_SIZE, mode: RunMode::Filter })
+        self.filter_run()
     }
 
-    fn tab_label(&self, i: usize) -> String {
-        self.results[i].title.clone().unwrap_or_else(|| format!("Result {}", i + 1))
-    }
+    // ----- results area ----------------------------------------------------
 
-    fn results_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        fks: &ForeignKeyIndex,
-        tables: &HashMap<(String, String), TableDetails>,
-        incoming: &HashMap<(String, String), Vec<IncomingKey>>,
-    ) -> Option<ConsoleAction> {
-        if self.results.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.weak(if self.run.is_some() { "Running…" } else { "Results appear here." });
-            });
-            return None;
-        }
+    fn results_area(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
         let mut action = None;
-        if self.results.len() > 1 {
-            let running = self.run.is_some();
-            let (mut close, mut select) = (None, None);
-            ui.horizontal_wrapped(|ui| {
-                for (i, tab) in self.results.iter().enumerate() {
-                    let failed = tab.outcome.is_err();
-                    let mut text = RichText::new(self.tab_label(i));
-                    if failed {
-                        text = text.color(ui.visuals().error_fg_color);
+        let idx = self.active_result.min(self.results.len() - 1);
+        let running = self.run.is_some();
+        let target = match &self.results[idx].outcome {
+            Ok(ExecOutcome::Rows(rs)) => Some(edits::edit_target(rs, cx.tables)),
+            _ => None,
+        };
+        let editable = matches!(target, Some(Ok(_)));
+
+        // Chips, result tabs and the + Row / Export buttons.
+        egui::Panel::top(egui::Id::new(("results-bar", self.id)))
+            .frame(
+                egui::Frame::new()
+                    .fill(color::BG)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .stroke(Stroke::new(1.0, color::BORDER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if idx == 0
+                        && self.table.is_some()
+                        && let Some(a) = self.chips(ui, running)
+                    {
+                        action = Some(a);
                     }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        if ui.selectable_label(self.active_result == i, text).on_hover_text(&tab.sql).clicked() {
-                            select = Some(i);
-                        }
-                        // Indices shift on close, so wait for a running statement to land first.
-                        if ui
-                            .add_enabled(!running, egui::Button::new("x").small())
-                            .on_hover_text("Close result")
-                            .clicked()
-                        {
-                            close = Some(i);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let tab = &mut self.results[idx];
+                        if let Ok(ExecOutcome::Rows(rs)) = &tab.outcome {
+                            ui.menu_button(format!("{}  Export  {}", icon::DOWNLOAD_SIMPLE, icon::CARET_DOWN), |ui| {
+                                if ui.button("CSV…").clicked() {
+                                    export(rs, "csv");
+                                    ui.close();
+                                }
+                                if ui.button("JSON…").clicked() {
+                                    export(rs, "json");
+                                    ui.close();
+                                }
+                            });
+                            if editable
+                                && ui
+                                    .add_enabled(
+                                        !running && !tab.submitting,
+                                        egui::Button::new(format!("{}  Row", icon::PLUS)),
+                                    )
+                                    .clicked()
+                            {
+                                tab.edits.inserts.push(vec![None; rs.columns.len()]);
+                            }
+                            if let Some(Err(reason)) = &target {
+                                ui.label(RichText::new("read-only").small().color(color::TEXT_WEAK))
+                                    .on_hover_text(reason);
+                            }
                         }
                     });
+                });
+                if let Some(e) = self.table.as_ref().and_then(|t| t.error.as_ref()).filter(|_| idx == 0) {
+                    ui.colored_label(color::DANGER, e);
                 }
+                self.result_tabs(ui, running);
             });
-            if let Some(i) = select {
-                self.select_result(i);
-            }
-            if let Some(i) = close {
-                self.close_result(i);
-            }
-            ui.separator();
+
+        if let Some(a) = self.status_bar(ui, idx, target.as_ref()) {
+            action = Some(a);
         }
-        let navigated = self.results.iter().any(|t| t.title.is_some());
-        if navigated && (!self.nav_back.is_empty() || !self.nav_forward.is_empty()) {
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.nav_back.is_empty(), egui::Button::new("< Back")).clicked() {
-                    self.go_back();
-                }
-                if ui.add_enabled(!self.nav_forward.is_empty(), egui::Button::new("Forward >")).clicked() {
-                    self.go_forward();
-                }
-                const TRAIL: usize = 5;
-                let steps: Vec<usize> =
-                    self.nav_back.iter().copied().chain(std::iter::once(self.active_result)).collect();
-                let shown = &steps[steps.len().saturating_sub(TRAIL)..];
-                let mut trail: Vec<String> =
-                    shown.iter().map(|&i| self.tab_label(i.min(self.results.len() - 1))).collect();
-                if steps.len() > TRAIL {
-                    trail.insert(0, "...".into());
-                }
-                ui.weak(trail.join("  >  "));
-            });
-            ui.separator();
+
+        // Row panel for the selected row.
+        let selected_row = match &self.results[idx].outcome {
+            Ok(ExecOutcome::Rows(_)) => self.results[idx].selection.single(),
+            _ => None,
+        };
+        if self.panel.as_ref().is_some_and(|p| Some(p.row) != selected_row || p.tab != idx) {
+            self.panel = None;
+            self.panel_open = true;
         }
-        let idx = self.active_result.min(self.results.len() - 1);
-        if idx == 0
-            && let Some(a) = self.filter_bar(ui)
+        if let Some(row) = selected_row.filter(|_| self.panel_open)
+            && let Some(a) = self.row_panel(ui, cx, idx, row, target.as_ref())
         {
             action = Some(a);
         }
-        let console_id = self.id;
-        let running = self.run.is_some();
-        let dialect = self.dialect;
-        let mut sort_request: Option<(usize, String)> = None;
-        let tab = &mut self.results[idx];
-        let target = match &tab.outcome {
-            Ok(ExecOutcome::Rows(rs)) => Some(edits::edit_target(rs, tables)),
-            _ => None,
-        };
 
-        ui.horizontal(|ui| match &tab.outcome {
-            Ok(ExecOutcome::Rows(rs)) => {
-                let more = if rs.truncated { "+" } else { "" };
-                ui.label(format!("{}{more} rows", rs.rows.len()));
-                ui.weak(format!("in {} ms", tab.elapsed.as_millis()));
-                if rs.truncated && is_read_only_query(&tab.sql) {
-                    if ui.add_enabled(!running, egui::Button::new("Load more")).clicked() {
-                        action = Some(ConsoleAction::Run {
-                            statements: vec![(tab.sql.clone(), tab.params.clone())],
-                            limit: tab.limit + PAGE_SIZE,
-                            mode: RunMode::Replace(idx),
-                        });
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(color::BG)).show(ui, |ui| {
+            if let Some(a) = self.grid(ui, cx, idx, target.as_ref(), running) {
+                action = Some(a);
+            }
+        });
+        action
+    }
+
+    /// Filter and order chips of a table's data.
+    fn chips(&mut self, ui: &mut egui::Ui, running: bool) -> Option<ConsoleAction> {
+        let tv = self.table.as_mut()?;
+        let mut rerun = false;
+        ui.label(RichText::new("Filters").color(color::TEXT_WEAK));
+        let mut remove = None;
+        for (i, f) in tv.filters.iter().enumerate() {
+            if chip(ui, &RichText::new(f).font(theme::mono(12.0))) {
+                remove = Some(i);
+            }
+        }
+        if let Some(i) = remove {
+            tv.filters.remove(i);
+            rerun = true;
+        }
+        match &mut tv.new_filter {
+            Some(text) => {
+                let r = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .font(theme::mono(12.0))
+                        .hint_text("e.g. vip = true")
+                        .desired_width(180.0),
+                );
+                r.request_focus();
+                let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+                if escape {
+                    tv.new_filter = None;
+                } else if r.lost_focus() {
+                    let condition = text.trim().to_string();
+                    tv.new_filter = None;
+                    if enter && !condition.is_empty() {
+                        tv.filters.push(condition);
+                        rerun = true;
                     }
-                } else if rs.truncated {
-                    ui.weak("(more rows not fetched)");
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match &target {
-                        Some(Ok(t)) => {
-                            let pending = tab.edits.row_count();
-                            let idle = !running && !tab.submitting;
-                            if ui
-                                .add_enabled(idle && pending > 0, egui::Button::new(format!("Submit ({pending})")))
-                                .on_hover_text("Write the changes to the database")
-                                .clicked()
-                            {
-                                action = Some(ConsoleAction::SubmitEdits {
-                                    tab: idx,
-                                    statements: edits::statements(dialect, t, rs, &tab.edits),
-                                });
-                            }
-                            if ui.add_enabled(idle && pending > 0, egui::Button::new("Revert all")).clicked() {
-                                tab.edits = Edits::default();
-                                tab.editing = None;
-                                tab.edit_error = None;
-                            }
-                            if ui.add_enabled(idle, egui::Button::new("+ Row")).clicked() {
-                                tab.edits.inserts.push(vec![None; rs.columns.len()]);
-                            }
-                            if tab.submitting {
-                                ui.spinner();
-                            }
-                            ui.weak(format!("editable: {}", t.table))
-                                .on_hover_text("Double-click a cell to edit; right-click for NULL, revert and delete");
-                        }
-                        Some(Err(reason)) => {
-                            ui.weak("read-only").on_hover_text(reason);
-                        }
-                        None => {}
-                    }
-                    ui.separator();
-                    if ui.button("Export JSON").clicked() {
-                        export(rs, "json");
-                    }
-                    if ui.button("Export CSV").clicked() {
-                        export(rs, "csv");
-                    }
-                });
             }
-            Ok(ExecOutcome::Affected(n)) => {
-                ui.label(format!("{n} row(s) affected"));
-                ui.weak(format!("in {} ms", tab.elapsed.as_millis()));
+            None => {
+                if ui.add_enabled(!running, theme::flat_button(format!("{}  Filter", icon::PLUS))).clicked() {
+                    tv.new_filter = Some(String::new());
+                }
             }
-            Err(e) => {
-                ui.vertical(|ui| {
-                    ui.colored_label(ui.visuals().error_fg_color, &e.message);
-                    if let Some(detail) = &e.detail {
-                        ui.weak(detail);
+        }
+        ui.add(egui::Separator::default().vertical().spacing(10.0));
+        ui.label(RichText::new("Order").color(color::TEXT_WEAK));
+        if !tv.order.trim().is_empty() {
+            let label = match tv.sort {
+                Some((_, asc)) => {
+                    let name = tv.order.split_whitespace().next().unwrap_or_default().trim_matches('"').to_string();
+                    format!("{name} {}", if asc { icon::ARROW_UP } else { icon::ARROW_DOWN })
+                }
+                None => tv.order.clone(),
+            };
+            if chip(ui, &RichText::new(label).font(theme::mono(12.0))) {
+                tv.order.clear();
+                tv.sort = None;
+                rerun = true;
+            }
+        } else {
+            ui.label(RichText::new("click a column header").small().color(color::TEXT_FAINT));
+        }
+        if rerun && !running { self.filter_run() } else { None }
+    }
+
+    /// Result tabs (several statements or navigation) and Back / Forward.
+    fn result_tabs(&mut self, ui: &mut egui::Ui, running: bool) {
+        let navigated = self.results.iter().any(|t| t.title.is_some());
+        if self.results.len() < 2 && !navigated {
+            return;
+        }
+        ui.add_space(4.0);
+        let (mut close, mut select) = (None, None);
+        ui.horizontal_wrapped(|ui| {
+            if navigated {
+                if ui
+                    .add_enabled(!self.nav_back.is_empty(), theme::flat_button(icon::ARROW_LEFT))
+                    .on_hover_text("Back")
+                    .clicked()
+                {
+                    self.go_back();
+                }
+                if ui
+                    .add_enabled(!self.nav_forward.is_empty(), theme::flat_button(icon::ARROW_RIGHT))
+                    .on_hover_text("Forward")
+                    .clicked()
+                {
+                    self.go_forward();
+                }
+            }
+            for i in 0..self.results.len() {
+                let failed = self.results[i].outcome.is_err();
+                let mut text = RichText::new(self.tab_label(i));
+                if failed {
+                    text = text.color(color::DANGER);
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if ui.selectable_label(self.active_result == i, text).on_hover_text(&self.results[i].sql).clicked()
+                    {
+                        select = Some(i);
                     }
-                    if let Some(code) = &e.code {
-                        ui.weak(format!("code {code}"));
+                    // Indices shift on close, so wait for a running statement to land first.
+                    if ui
+                        .add_enabled(!running, theme::flat_button(RichText::new(icon::X).small()))
+                        .on_hover_text("Close result")
+                        .clicked()
+                    {
+                        close = Some(i);
                     }
                 });
             }
         });
-        if let Some(error) = &tab.edit_error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+        if let Some(i) = select {
+            self.select_result(i);
         }
-        ui.separator();
-        if let Ok(ExecOutcome::Rows(rs)) = &tab.outcome {
-            let is_link = |row: usize, col: usize| link_for_cell(&rs.columns, &rs.rows[row], col, fks).is_some();
-            let edit =
-                matches!(target, Some(Ok(_))).then(|| GridEdit { edits: &mut tab.edits, editing: &mut tab.editing });
-            let table = single_table(rs);
-            // Keys in other tables that point at any table this result reads from.
-            let origin_tables: std::collections::BTreeSet<(String, String)> = rs
-                .columns
-                .iter()
-                .filter_map(|c| c.origin.as_ref())
-                .map(|o| (o.schema.clone(), o.table.clone()))
-                .collect();
-            let keys: Vec<&IncomingKey> = origin_tables.iter().filter_map(|t| incoming.get(t)).flatten().collect();
-            let referencing = |row: usize| -> Vec<(usize, String)> {
-                keys.iter()
-                    .enumerate()
-                    .filter(|(_, k)| referencing_values(&rs.columns, &rs.rows[row], k).is_some())
-                    .map(|(i, k)| (i, format!("{} ({})", k.table, k.foreign_key.columns.join(", "))))
-                    .collect()
-            };
-            let opts = GridOptions {
-                id: (console_id, idx),
-                is_link: &is_link,
-                edit,
-                selection: &mut tab.selection,
-                dialect,
-                table: table.as_deref(),
-                referencing: &referencing,
-                server_sort: self.table.as_ref().filter(|_| idx == 0).map(|tv| tv.sort),
-            };
-            match grid::show(ui, rs, &mut tab.sort, opts) {
-                Some(_) if running => {}
-                Some(GridEvent::Link(row, col)) => {
-                    if let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks) {
-                        action = Some(navigate(dialect, idx, &link));
-                    }
-                }
-                Some(GridEvent::SortBy(col)) => {
-                    let name = rs.columns[col].name.clone();
-                    sort_request = Some((col, name));
-                }
-                Some(GridEvent::Referencing { row, key }) => {
-                    if let Some(k) = keys.get(key)
-                        && let Some(values) = referencing_values(&rs.columns, &rs.rows[row], k)
-                    {
-                        action = Some(navigate_referencing(dialect, idx, k, &values));
-                    }
-                }
-                None => {}
+        if let Some(i) = close {
+            self.close_result(i);
+        }
+    }
+
+    fn grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &ConsoleContext<'_>,
+        idx: usize,
+        target: Option<&Result<EditTarget, String>>,
+        running: bool,
+    ) -> Option<ConsoleAction> {
+        let console_id = self.id;
+        let dialect = self.dialect;
+        let server_sort = self.table.as_ref().filter(|_| idx == 0).map(|tv| tv.sort);
+        let tab = &mut self.results[idx];
+        let rs = match &tab.outcome {
+            Ok(ExecOutcome::Rows(rs)) => rs,
+            Ok(ExecOutcome::Affected(n)) => {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(format!("{n} row(s) affected")).font(theme::font(14.0, theme::medium())));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(&tab.sql).font(theme::mono(12.0)).color(color::TEXT_WEAK));
+                });
+                return None;
             }
-        } else {
-            ui.add(egui::Label::new(RichText::new(&tab.sql).monospace().weak()).wrap());
+            Err(e) => {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(&e.message).font(theme::font(14.0, theme::medium())).color(color::DANGER),
+                        );
+                        if let Some(detail) = &e.detail {
+                            ui.label(RichText::new(detail).color(color::TEXT_WEAK));
+                        }
+                        if let Some(code) = &e.code {
+                            ui.label(RichText::new(format!("code {code}")).small().color(color::TEXT_WEAK));
+                        }
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(&tab.sql).font(theme::mono(12.0)).color(color::TEXT_WEAK));
+                    });
+                });
+                return None;
+            }
+        };
+        let fks = cx.fks;
+        let is_link = |row: usize, col: usize| link_for_cell(&rs.columns, &rs.rows[row], col, fks).is_some();
+        let meta = column_meta(rs, cx.tables);
+        let edit = matches!(target, Some(Ok(_))).then(|| GridEdit { edits: &mut tab.edits, editing: &mut tab.editing });
+        let table = single_table(rs);
+        let keys = incoming_keys(rs, cx.incoming);
+        let referencing = |row: usize| -> Vec<(usize, String)> {
+            keys.iter()
+                .enumerate()
+                .filter(|(_, k)| referencing_values(&rs.columns, &rs.rows[row], k).is_some())
+                .map(|(i, k)| (i, format!("{} ({})", k.table, k.foreign_key.columns.join(", "))))
+                .collect()
+        };
+        let opts = GridOptions {
+            id: (console_id, idx),
+            columns: &meta,
+            is_link: &is_link,
+            edit,
+            selection: &mut tab.selection,
+            dialect,
+            table: table.as_deref(),
+            referencing: &referencing,
+            server_sort,
+        };
+        let mut sort_request = None;
+        let mut action = None;
+        match grid::show(ui, rs, &mut tab.sort, opts) {
+            Some(_) if running => {}
+            Some(GridEvent::Link(row, col)) => {
+                if let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks) {
+                    action = Some(navigate(dialect, idx, &link));
+                }
+            }
+            Some(GridEvent::SortBy(col)) => sort_request = Some((col, rs.columns[col].name.clone())),
+            Some(GridEvent::Referencing { row, key }) => {
+                if let Some(k) = keys.get(key)
+                    && let Some(values) = referencing_values(&rs.columns, &rs.rows[row], k)
+                {
+                    action = Some(navigate_referencing(dialect, idx, k, &values));
+                }
+            }
+            None => {}
         }
-        if let Some((col, name)) = sort_request
-            && let Some(a) = self.sort_table_by(col, &name)
-        {
-            action = Some(a);
+        if let Some((col, name)) = sort_request {
+            action = self.sort_table_by(col, &name);
         }
         action
     }
+
+    // ----- status bar ------------------------------------------------------
+
+    fn status_frame() -> egui::Frame {
+        egui::Frame::new()
+            .fill(color::BG_SUBTLE)
+            .inner_margin(egui::Margin::symmetric(12, 7))
+            .stroke(Stroke::new(1.0, color::BORDER))
+    }
+
+    fn run_status(&self, ui: &mut egui::Ui) -> Option<ConsoleAction> {
+        let run = self.run.as_ref()?;
+        ui.spinner();
+        ui.label(
+            RichText::new(format!(
+                "Running {}/{} · {:.1} s",
+                (run.done + 1).min(run.total),
+                run.total,
+                run.started.elapsed().as_secs_f32()
+            ))
+            .color(color::TEXT_WEAK),
+        );
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        ui.add(theme::flat_button(format!("{}  Cancel", icon::STOP))).clicked().then_some(ConsoleAction::Cancel)
+    }
+
+    fn tx_notice(&self, ui: &mut egui::Ui) {
+        match &self.tx_notice {
+            Some(Ok(msg)) => {
+                ui.label(RichText::new(msg).color(color::TEXT_WEAK));
+            }
+            Some(Err(e)) => {
+                ui.colored_label(color::DANGER, e);
+            }
+            None => {}
+        }
+    }
+
+    fn status_bar_when_empty(&mut self, ui: &mut egui::Ui) -> Option<ConsoleAction> {
+        let mut action = None;
+        egui::Panel::bottom(egui::Id::new(("status", self.id))).frame(Self::status_frame()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                action = self.run_status(ui);
+                self.tx_notice(ui);
+            });
+        });
+        action
+    }
+
+    fn status_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        target: Option<&Result<EditTarget, String>>,
+    ) -> Option<ConsoleAction> {
+        let mut action = None;
+        let dialect = self.dialect;
+        let save = ui.input_mut(|i| i.consume_shortcut(&SAVE));
+        egui::Panel::bottom(egui::Id::new(("status", self.id))).frame(Self::status_frame()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(a) = self.run_status(ui) {
+                    action = Some(a);
+                }
+                let running = self.run.is_some();
+                let tab = &self.results[idx];
+                match &tab.outcome {
+                    Ok(ExecOutcome::Rows(rs)) => {
+                        let shown = if rs.truncated {
+                            format!("{}+ rows", rs.rows.len())
+                        } else {
+                            format!("{} rows", rs.rows.len())
+                        };
+                        ui.label(RichText::new(shown).font(theme::font(12.5, theme::semibold())));
+                        ui.label(RichText::new(format!("· {} ms", tab.elapsed.as_millis())).color(color::TEXT_WEAK));
+                        if rs.truncated && is_read_only_query(&tab.sql) {
+                            if ui.add_enabled(!running, egui::Link::new("Load more")).clicked() {
+                                action = Some(ConsoleAction::Run {
+                                    statements: vec![(tab.sql.clone(), tab.params.clone())],
+                                    limit: tab.limit + PAGE_SIZE,
+                                    mode: RunMode::Replace(idx),
+                                });
+                            }
+                        } else if rs.truncated {
+                            ui.label(RichText::new("(more rows not fetched)").color(color::TEXT_WEAK));
+                        }
+                    }
+                    Ok(ExecOutcome::Affected(n)) => {
+                        ui.label(format!("{n} row(s) affected"));
+                        ui.label(RichText::new(format!("· {} ms", tab.elapsed.as_millis())).color(color::TEXT_WEAK));
+                    }
+                    Err(_) => {
+                        ui.colored_label(color::DANGER, "Statement failed");
+                    }
+                }
+                self.tx_notice(ui);
+                if let Some(e) = &tab.edit_error {
+                    ui.colored_label(color::DANGER, e.lines().next().unwrap_or_default()).on_hover_text(e);
+                }
+
+                let Some(Ok(t)) = target else { return };
+                let pending = tab.edits.row_count();
+                if pending == 0 {
+                    return;
+                }
+                let idle = !running && !tab.submitting;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let ctx = ui.ctx().clone();
+                    let Ok(ExecOutcome::Rows(rs)) = &self.results[idx].outcome else { return };
+                    let statements = || edits::statements(dialect, t, rs, &self.results[idx].edits);
+                    let save_button = theme::primary_button(format!("Save   {}", ctx.format_shortcut(&SAVE)));
+                    if (ui.add_enabled(idle, save_button).clicked() || (save && idle)) && pending > 0 {
+                        action = Some(ConsoleAction::SubmitEdits { tab: idx, statements: statements() });
+                    }
+                    let discard = ui.add_enabled(idle, egui::Button::new("Discard")).clicked();
+                    if ui.button("View SQL").clicked() {
+                        let text = statements()
+                            .iter()
+                            .map(|(sql, params, _)| format!("{sql};\n-- params: {}", format_params(params)))
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        self.view_sql = Some(text);
+                    }
+                    if self.results[idx].submitting {
+                        ui.spinner();
+                    }
+                    theme::pill(
+                        ui,
+                        RichText::new(format!("●  {pending} pending change{}", if pending == 1 { "" } else { "s" }))
+                            .color(Color32::from_rgb(140, 105, 0)),
+                        color::CHANGED,
+                    );
+                    if discard {
+                        let tab = &mut self.results[idx];
+                        tab.edits = Edits::default();
+                        tab.editing = None;
+                        tab.edit_error = None;
+                        self.panel = None;
+                    }
+                });
+            });
+        });
+        action
+    }
+
+    fn view_sql_modal(&mut self, ui: &egui::Ui) {
+        let Some(text) = &self.view_sql else { return };
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new(("view-sql", self.id))).show(ui.ctx(), |ui| {
+            ui.set_width(560.0);
+            ui.heading("Pending changes as SQL");
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                let mut view = text.as_str();
+                let mut layouter = |ui: &egui::Ui, t: &dyn egui::TextBuffer, w: f32| {
+                    let job = sql_highlight::layout(ui, t.as_str(), w);
+                    ui.fonts_mut(|f| f.layout_job(job))
+                };
+                ui.add(
+                    egui::TextEdit::multiline(&mut view)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter),
+                );
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                });
+            });
+        });
+        if close || modal.should_close() {
+            self.view_sql = None;
+        }
+    }
+
+    // ----- row panel -------------------------------------------------------
+
+    fn row_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &ConsoleContext<'_>,
+        idx: usize,
+        row: usize,
+        target: Option<&Result<EditTarget, String>>,
+    ) -> Option<ConsoleAction> {
+        let mut action = None;
+        let dialect = self.dialect;
+        let editable = matches!(target, Some(Ok(_)));
+        let tab = &mut self.results[idx];
+        let Ok(ExecOutcome::Rows(rs)) = &tab.outcome else { return None };
+        if row >= rs.rows.len() {
+            return None;
+        }
+        let deleted = tab.edits.deletes.contains(&row);
+        let current =
+            |c: usize, edits: &Edits| edits.updates.get(&(row, c)).cloned().unwrap_or_else(|| rs.rows[row][c].clone());
+        let panel = self.panel.get_or_insert_with(|| RowPanel {
+            tab: idx,
+            row,
+            buffers: (0..rs.columns.len())
+                .map(|c| match current(c, &tab.edits) {
+                    Value::Null => String::new(),
+                    v => v.to_string(),
+                })
+                .collect(),
+        });
+        let meta = column_meta(rs, cx.tables);
+        let pk = meta.iter().position(|m| m.primary_key);
+        let title = match pk {
+            Some(c) => format!("Row · {} {}", rs.columns[c].name, rs.rows[row][c]),
+            None => format!("Row {}", row + 1),
+        };
+        let mut close = false;
+        egui::Panel::right(egui::Id::new(("row-panel", self.id)))
+            .resizable(true)
+            .default_size(270.0)
+            .min_size(200.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(color::BG_SUBTLE)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .stroke(Stroke::new(1.0, color::BORDER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(title).font(theme::font(13.5, theme::semibold())));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(theme::flat_button(icon::X)).on_hover_text("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for (c, col) in rs.columns.iter().enumerate() {
+                        let m = &meta[c];
+                        let value = current(c, &tab.edits);
+                        let changed = tab.edits.updates.contains_key(&(row, c));
+                        let can_edit = editable && !deleted && !m.primary_key;
+                        ui.add_space(4.0);
+                        if let Some(b) = grid::as_bool(&value, m.boolean) {
+                            ui.horizontal(|ui| {
+                                let r = grid::checkbox_glyph(ui, b);
+                                ui.label(&col.name);
+                                if changed {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new("changed").small().color(color::WARNING));
+                                    });
+                                }
+                                if r.clicked() && can_edit {
+                                    tab.edits.set(rs, RowRef::Existing(row), c, Value::Bool(!b));
+                                }
+                            });
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&col.name).color(color::TEXT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let detail = if changed {
+                                    RichText::new("changed").small().color(color::WARNING)
+                                } else {
+                                    let mut d = col.type_name.to_lowercase();
+                                    if m.primary_key {
+                                        d.push_str(" · PK");
+                                    }
+                                    RichText::new(d).small().color(color::TEXT_WEAK)
+                                };
+                                ui.label(detail);
+                            });
+                        });
+                        let fill = if changed {
+                            color::CHANGED
+                        } else if can_edit {
+                            color::BG
+                        } else {
+                            color::BG_SUNKEN
+                        };
+                        let stroke = if changed { color::CHANGED_EDGE } else { color::BORDER };
+                        let r = egui::Frame::new()
+                            .fill(fill)
+                            .stroke(Stroke::new(1.0, stroke))
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.add_enabled(
+                                    can_edit,
+                                    egui::TextEdit::singleline(&mut panel.buffers[c])
+                                        .frame(egui::Frame::NONE)
+                                        .font(theme::mono(12.5))
+                                        .hint_text(if value.is_null() { "NULL" } else { "" })
+                                        .desired_width(f32::INFINITY),
+                                )
+                            })
+                            .inner;
+                        if r.changed() {
+                            tab.edits.set(rs, RowRef::Existing(row), c, Value::Text(panel.buffers[c].clone()));
+                        }
+                        if can_edit {
+                            r.context_menu(|ui| {
+                                if ui.button("Set NULL").clicked() {
+                                    panel.buffers[c].clear();
+                                    tab.edits.set(rs, RowRef::Existing(row), c, Value::Null);
+                                }
+                                if changed && ui.button("Revert").clicked() {
+                                    tab.edits.updates.remove(&(row, c));
+                                    panel.buffers[c] = match &rs.rows[row][c] {
+                                        Value::Null => String::new(),
+                                        v => v.to_string(),
+                                    };
+                                }
+                            });
+                        }
+                    }
+
+                    let keys = incoming_keys(rs, cx.incoming);
+                    let links: Vec<(&IncomingKey, Vec<Value>)> = keys
+                        .iter()
+                        .filter_map(|k| referencing_values(&rs.columns, &rs.rows[row], k).map(|v| (*k, v)))
+                        .collect();
+                    if !links.is_empty() {
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.label(theme::caption("Referenced by"));
+                        for (k, values) in links {
+                            ui.horizontal(|ui| {
+                                let label = format!("{}.{}", k.table, k.foreign_key.columns.join(", "));
+                                if ui.link(RichText::new(label).color(color::LINK)).clicked() {
+                                    action = Some(navigate_referencing(dialect, idx, k, &values));
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(icon::ARROW_RIGHT).color(color::TEXT_WEAK));
+                                });
+                            });
+                        }
+                    }
+                });
+            });
+        if close {
+            self.panel_open = false;
+            self.panel = None;
+        }
+        action
+    }
+
+    // ----- structure and DDL views ------------------------------------------
+
+    fn structure_view(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) {
+        let Some(tv) = &self.table else { return };
+        let key = (tv.schema.clone(), tv.table.clone());
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(color::BG).inner_margin(16)).show(ui, |ui| {
+            let Some(d) = cx.tables.get(&key) else {
+                if !self.wanted_details.contains(&key) {
+                    self.wanted_details.push(key.clone());
+                }
+                ui.spinner();
+                return;
+            };
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                section(ui, "Columns", d.columns.len());
+                structure_table(ui, "cols", &["Name", "Type", "Nullable", "Default", "Key"], |ui| {
+                    for c in &d.columns {
+                        let fk = d.foreign_key_for(&c.name);
+                        ui.horizontal(|ui| {
+                            if c.pk_position.is_some() {
+                                ui.label(RichText::new(icon::KEY).color(color::WARNING));
+                            }
+                            ui.label(RichText::new(&c.name).font(theme::font(13.0, theme::medium())));
+                        });
+                        ui.label(RichText::new(&c.data_type).font(theme::mono(12.0)));
+                        ui.label(if c.nullable { "yes" } else { "no" });
+                        ui.label(
+                            RichText::new(c.default.clone().unwrap_or_default())
+                                .font(theme::mono(12.0))
+                                .color(color::TEXT_WEAK),
+                        );
+                        let mut keys = Vec::new();
+                        if c.pk_position.is_some() {
+                            keys.push("PK".to_string());
+                        }
+                        if let Some(fk) = fk {
+                            keys.push(format!("FK → {}.{}", fk.ref_table, fk.ref_columns.join(", ")));
+                        }
+                        ui.label(RichText::new(keys.join("  ")).color(color::TEXT_WEAK));
+                        ui.end_row();
+                    }
+                });
+                section(ui, "Indexes", d.indexes.len());
+                structure_table(ui, "idx", &["Name", "Columns", "Kind"], |ui| {
+                    for i in &d.indexes {
+                        ui.label(&i.name);
+                        ui.label(RichText::new(i.columns.join(", ")).font(theme::mono(12.0)));
+                        ui.label(
+                            RichText::new(if i.primary {
+                                "primary"
+                            } else if i.unique {
+                                "unique"
+                            } else {
+                                ""
+                            })
+                            .color(color::TEXT_WEAK),
+                        );
+                        ui.end_row();
+                    }
+                });
+                section(ui, "Foreign keys", d.foreign_keys.len());
+                structure_table(ui, "fks", &["Name", "Columns", "References"], |ui| {
+                    for fk in &d.foreign_keys {
+                        ui.label(&fk.name);
+                        ui.label(RichText::new(fk.columns.join(", ")).font(theme::mono(12.0)));
+                        ui.label(
+                            RichText::new(format!(
+                                "{}.{} ({})",
+                                fk.ref_schema,
+                                fk.ref_table,
+                                fk.ref_columns.join(", ")
+                            ))
+                            .font(theme::mono(12.0)),
+                        );
+                        ui.end_row();
+                    }
+                });
+                let incoming = cx.incoming.get(&key).map(Vec::as_slice).unwrap_or_default();
+                section(ui, "Referenced by", incoming.len());
+                structure_table(ui, "inc", &["Table", "Columns"], |ui| {
+                    for k in incoming {
+                        ui.label(format!("{}.{}", k.schema, k.table));
+                        ui.label(RichText::new(k.foreign_key.columns.join(", ")).font(theme::mono(12.0)));
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    }
+
+    fn ddl_view(&mut self, ui: &mut egui::Ui) {
+        let Some(tv) = &self.table else { return };
+        if tv.ddl.is_none() {
+            self.wanted_ddl = true;
+        }
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(color::BG).inner_margin(16)).show(
+            ui,
+            |ui| match &tv.ddl {
+                Some(Ok(ddl)) => {
+                    if ui.button(format!("{}  Copy", icon::COPY)).clicked() {
+                        ui.ctx().copy_text(ddl.clone());
+                    }
+                    ui.add_space(8.0);
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                        let job = sql_highlight::layout(ui, text.as_str(), wrap_width);
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                        let mut view = ddl.as_str();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut view)
+                                .code_editor()
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter),
+                        );
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(color::DANGER, e);
+                }
+                None => {
+                    ui.spinner();
+                }
+            },
+        );
+    }
+}
+
+/// A removable chip; returns whether its × was clicked.
+fn chip(ui: &mut egui::Ui, text: &RichText) -> bool {
+    let mut removed = false;
+    egui::Frame::new()
+        .fill(color::ACCENT_SOFT)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(214, 206, 250)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(text.clone().color(color::ACCENT_TEXT));
+            let x = ui.add(
+                egui::Label::new(RichText::new(icon::X).size(11.0).color(color::ACCENT_TEXT))
+                    .sense(egui::Sense::click()),
+            );
+            removed = x.on_hover_text("Remove").clicked();
+        });
+    removed
+}
+
+fn section(ui: &mut egui::Ui, title: &str, count: usize) {
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.label(theme::caption(title));
+        ui.label(RichText::new(count.to_string()).small().color(color::TEXT_FAINT));
+    });
+    ui.add_space(4.0);
+}
+
+fn structure_table(ui: &mut egui::Ui, id: &str, headers: &[&str], body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new().stroke(Stroke::new(1.0, color::BORDER)).corner_radius(8).inner_margin(10).show(ui, |ui| {
+        egui::Grid::new(id).striped(true).spacing([24.0, 8.0]).min_col_width(60.0).show(ui, |ui| {
+            for h in headers {
+                ui.label(RichText::new(*h).small().font(theme::font(11.0, theme::semibold())).color(color::TEXT_WEAK));
+            }
+            ui.end_row();
+            body(ui);
+        });
+    });
+}
+
+/// Per result column: whether it is the primary key, NOT NULL, or boolean,
+/// from the origin table's details when loaded.
+fn column_meta(rs: &ResultSet, tables: &HashMap<(String, String), TableDetails>) -> Vec<ColumnMeta> {
+    rs.columns
+        .iter()
+        .map(|col| {
+            let info = col.origin.as_ref().and_then(|o| {
+                tables.get(&(o.schema.clone(), o.table.clone()))?.columns.iter().find(|c| c.name == o.column)
+            });
+            ColumnMeta {
+                primary_key: info.is_some_and(|c| c.pk_position.is_some()),
+                not_null: info.is_some_and(|c| !c.nullable),
+                boolean: col.type_name.to_ascii_lowercase().starts_with("bool"),
+            }
+        })
+        .collect()
+}
+
+/// Keys in other tables that point at any table this result reads from.
+fn incoming_keys<'a>(
+    rs: &ResultSet,
+    incoming: &'a HashMap<(String, String), Vec<IncomingKey>>,
+) -> Vec<&'a IncomingKey> {
+    let origin_tables: std::collections::BTreeSet<(String, String)> =
+        rs.columns.iter().filter_map(|c| c.origin.as_ref()).map(|o| (o.schema.clone(), o.table.clone())).collect();
+    origin_tables.iter().filter_map(|t| incoming.get(t)).flatten().collect()
+}
+
+fn format_params(params: &[Value]) -> String {
+    params.iter().map(|v| if v.is_null() { "NULL".into() } else { format!("'{v}'") }).collect::<Vec<_>>().join(", ")
 }
 
 /// The table every column of `rs` was read from, if there is exactly one.
-fn single_table(rs: &dbm_core::ResultSet) -> Option<String> {
+fn single_table(rs: &ResultSet) -> Option<String> {
     let mut tables = rs.columns.iter().map(|c| c.origin.as_ref().map(|o| &o.table));
     let first = tables.next()??;
     tables.all(|t| t == Some(first)).then(|| first.clone())
@@ -900,7 +1621,7 @@ fn navigate_referencing(dialect: Dialect, from: usize, key: &IncomingKey, values
     }
 }
 
-fn export(rs: &dbm_core::ResultSet, format: &str) {
+fn export(rs: &ResultSet, format: &str) {
     let Some(path) = rfd::FileDialog::new()
         .add_filter(format.to_uppercase(), &[format])
         .set_file_name(format!("result.{format}"))

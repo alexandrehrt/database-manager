@@ -1,13 +1,14 @@
-//! Database explorer: data source → schema → tables/views → columns, keys
-//! and indexes. Each level loads when it is first expanded.
+//! The sidebar: objects of the current data source (tables and views of the
+//! selected schema, loaded on demand) and the list of connections.
 
 use std::collections::HashMap;
 
 use dbm_core::config::DataSourceConfig;
-use dbm_core::{Relation, RelationKind, TableDetails};
-use eframe::egui::{self, RichText};
+use dbm_core::{Relation, RelationKind};
+use eframe::egui::{self, Color32, RichText, Sense};
 
 use crate::app::Action;
+use crate::ui::theme::{self, color, icon};
 
 pub enum Loadable<T> {
     NotLoaded,
@@ -37,12 +38,7 @@ impl Default for SourceTree {
 
 pub struct SchemaNode {
     pub name: String,
-    pub relations: Loadable<Vec<RelationNode>>,
-}
-
-pub struct RelationNode {
-    pub relation: Relation,
-    pub details: Loadable<TableDetails>,
+    pub relations: Loadable<Vec<Relation>>,
 }
 
 /// Case-insensitive substring match; returns the byte range of the match.
@@ -55,364 +51,261 @@ pub fn find_match(name: &str, filter: &str) -> Option<std::ops::Range<usize>> {
     name.is_char_boundary(start + filter.len()).then(|| start..start + filter.len()).or(Some(0..0))
 }
 
-/// `name` with the part matching `filter` highlighted.
-fn highlighted(ui: &egui::Ui, name: &str, filter: &str) -> egui::WidgetText {
-    let Some(range) = find_match(name, filter).filter(|r| !r.is_empty()) else {
-        return name.into();
-    };
-    let plain = egui::TextFormat { color: ui.visuals().text_color(), ..Default::default() };
-    let hit = egui::TextFormat {
-        color: ui.visuals().strong_text_color(),
-        background: egui::Color32::from_rgba_premultiplied(120, 95, 0, 110),
-        ..Default::default()
-    };
-    let mut job = egui::text::LayoutJob::default();
-    job.append(&name[..range.start], 0.0, plain.clone());
-    job.append(&name[range.clone()], 0.0, hit);
-    job.append(&name[range.end..], 0.0, plain);
-    job.into()
-}
-
-fn schema_matches(node: &SchemaNode, filter: &str) -> bool {
-    match &node.relations {
-        Loadable::Loaded(rels) => rels.iter().any(|r| find_match(&r.relation.name, filter).is_some()),
-        // Still loading: keep it visible so the spinner shows.
-        Loadable::NotLoaded | Loadable::Loading => true,
-        Loadable::Failed(_) => false,
+pub fn status_color(status: &ConnStatus) -> Color32 {
+    match status {
+        ConnStatus::Connected => color::SUCCESS,
+        ConnStatus::Connecting => color::WARNING,
+        ConnStatus::Failed(_) => color::DANGER,
+        ConnStatus::Disconnected => color::TEXT_FAINT,
     }
 }
 
-/// `filter` hides tables whose names don't contain it, opens the parents of
-/// the ones that do and loads the relations of every schema of connected
-/// sources so they can be searched.
+/// What the sidebar needs to know about the main area.
+pub struct SidebarState<'a> {
+    pub current: Option<&'a str>,
+    pub schema: Option<&'a str>,
+    /// (schema, table) of the active table tab, highlighted in the list.
+    pub active_table: Option<(&'a str, &'a str)>,
+}
+
+/// A full-width clickable row with an optional highlight.
+fn row(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let height = 26.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    let fill = if selected {
+        color::ACCENT_SOFT
+    } else if response.hovered() {
+        color::BG_SUNKEN
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 6.0, fill);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.spacing_mut().item_spacing.x = 8.0;
+    add(&mut child);
+    response
+}
+
+fn highlighted(name: &str, filter: &str, strong: bool) -> egui::WidgetText {
+    let base = egui::TextFormat {
+        font_id: theme::font(13.0, if strong { theme::medium() } else { egui::FontFamily::Proportional }),
+        color: if strong { color::ACCENT_TEXT } else { color::TEXT },
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    match find_match(name, filter).filter(|r| !r.is_empty()) {
+        None => job.append(name, 0.0, base),
+        Some(range) => {
+            let hit = egui::TextFormat { background: Color32::from_rgb(255, 236, 160), ..base.clone() };
+            job.append(&name[..range.start], 0.0, base.clone());
+            job.append(&name[range.clone()], 0.0, hit);
+            job.append(&name[range.end..], 0.0, base);
+        }
+    }
+    job.into()
+}
+
+fn section_header(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(theme::caption(title));
+        if let Some(n) = count {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(n.to_string()).small().color(color::TEXT_WEAK));
+            });
+        }
+    });
+    ui.add_space(2.0);
+}
+
+fn spinner_row(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.spinner();
+        ui.label(RichText::new(text).color(color::TEXT_WEAK));
+    });
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     sources: &[DataSourceConfig],
     trees: &mut HashMap<String, SourceTree>,
+    state: SidebarState<'_>,
     filter: &mut String,
     actions: &mut Vec<Action>,
 ) {
-    ui.horizontal(|ui| {
-        ui.strong("Database Explorer");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("+").on_hover_text("New data source").clicked() {
-                actions.push(Action::NewSource);
-            }
-        });
-    });
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(filter)
-                .hint_text("Filter tables (Cmd+O to go to one)")
-                .desired_width(ui.available_width() - 24.0),
-        );
-        if !filter.is_empty() && ui.small_button("x").on_hover_text("Clear filter").clicked() {
-            filter.clear();
-        }
-    });
-    ui.separator();
+    ui.add(
+        egui::TextEdit::singleline(filter)
+            .hint_text(format!("{}  Filter objects", icon::MAGNIFYING_GLASS))
+            .desired_width(f32::INFINITY)
+            .margin(egui::vec2(8.0, 5.0)),
+    );
     let filter = filter.trim().to_string();
-    let filter = filter.as_str();
 
-    if sources.is_empty() {
-        ui.weak("No data sources yet. Click + to add one.");
-        return;
-    }
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        if let Some(current) = state.current {
+            let tree = trees.entry(current.to_string()).or_default();
+            objects(ui, current, tree, &state, &filter, actions);
+        } else if sources.is_empty() {
+            ui.add_space(10.0);
+            ui.label(RichText::new("Add a connection to get started.").color(color::TEXT_WEAK));
+        }
 
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_space(8.0);
+        ui.separator();
+        section_header(ui, "Connections", None);
         for source in sources {
-            let tree = trees.entry(source.id.clone()).or_default();
-            source_node(ui, source, tree, filter, actions);
+            let status = trees.get(&source.id).map_or(&ConnStatus::Disconnected, |t| &t.status);
+            let dot = status_color(status);
+            let is_current = state.current == Some(source.id.as_str());
+            let response = row(ui, false, |ui| {
+                ui.label(RichText::new("●").font(theme::font(9.0, egui::FontFamily::Proportional)).color(dot));
+                let text = RichText::new(&source.name);
+                ui.label(if is_current { text.font(theme::font(13.0, theme::medium())) } else { text });
+            });
+            let id = source.id.clone();
+            let connected = *status == ConnStatus::Connected;
+            let hover = match status {
+                ConnStatus::Failed(e) => e.clone(),
+                _ => source_description(source),
+            };
+            if response.clicked() {
+                actions.push(Action::SelectSource(id.clone()));
+            }
+            response.on_hover_text(hover).context_menu(|ui| {
+                if ui.button("New console").clicked() {
+                    actions.push(Action::NewConsole(id.clone()));
+                }
+                if connected {
+                    if ui.button("Refresh").clicked() {
+                        actions.push(Action::Refresh(id.clone()));
+                    }
+                    if ui.button("Disconnect").clicked() {
+                        actions.push(Action::Disconnect(id.clone()));
+                    }
+                } else if ui.button("Connect").clicked() {
+                    actions.push(Action::Connect(id.clone()));
+                }
+                ui.separator();
+                if ui.button("Edit…").clicked() {
+                    actions.push(Action::EditSource(id.clone()));
+                }
+            });
+        }
+        let add = row(ui, false, |ui| {
+            ui.label(RichText::new(icon::PLUS).color(color::TEXT_WEAK));
+            ui.label(RichText::new("New connection").color(color::TEXT_WEAK));
+        });
+        if add.clicked() {
+            actions.push(Action::NewSource);
         }
     });
 }
 
-fn status_dot(status: &ConnStatus, ui: &egui::Ui) -> egui::Color32 {
-    match status {
-        ConnStatus::Connected => egui::Color32::from_rgb(80, 180, 90),
-        ConnStatus::Connecting => egui::Color32::from_rgb(220, 170, 50),
-        ConnStatus::Failed(_) => ui.visuals().error_fg_color,
-        ConnStatus::Disconnected => ui.visuals().weak_text_color(),
+/// "SQLite · local" / "PostgreSQL · host:port".
+pub fn source_description(source: &DataSourceConfig) -> String {
+    match &source.kind {
+        dbm_core::config::DataSourceKind::Sqlite { .. } => "SQLite · local".into(),
+        dbm_core::config::DataSourceKind::Postgres { host, port, .. } => format!("PostgreSQL · {host}:{port}"),
     }
 }
 
-fn source_node(
+fn objects(
     ui: &mut egui::Ui,
-    source: &DataSourceConfig,
+    source: &str,
     tree: &mut SourceTree,
+    state: &SidebarState<'_>,
     filter: &str,
     actions: &mut Vec<Action>,
 ) {
-    if !filter.is_empty() && tree.status == ConnStatus::Connected {
-        let id = ui.make_persistent_id(("source", &source.id));
-        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-        state.set_open(true);
-        state.store(ui.ctx());
-    }
-    let id = source.id.clone();
-    let engine = match source.kind.dialect() {
-        dbm_core::Dialect::Postgres => "pg",
-        dbm_core::Dialect::Sqlite => "sqlite",
-    };
-    let dot = status_dot(&tree.status, ui);
-    let state_id = ui.make_persistent_id(("source", &id));
-    let header = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), state_id, false)
-        .show_header(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.0, dot);
-            ui.add(egui::Label::new(RichText::new(&source.name).strong()).sense(egui::Sense::click()).selectable(false))
-        });
-    let (_, name_response, _) = header.body(|ui| match &tree.status {
+    match &tree.status {
         ConnStatus::Disconnected => {
             tree.status = ConnStatus::Connecting;
-            actions.push(Action::Connect(id.clone()));
+            actions.push(Action::Connect(source.to_string()));
+            return;
         }
-        ConnStatus::Connecting => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak("Connecting…");
-            });
-        }
+        ConnStatus::Connecting => return spinner_row(ui, "Connecting…"),
         ConnStatus::Failed(e) => {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-            if ui.small_button("Retry").clicked() {
-                actions.push(Action::Connect(id.clone()));
+            ui.add_space(8.0);
+            ui.colored_label(color::DANGER, e);
+            if ui.button("Retry").clicked() {
+                actions.push(Action::Connect(source.to_string()));
             }
+            return;
         }
-        ConnStatus::Connected => schemas(ui, &id, &mut tree.schemas, filter, actions),
-    });
-    let name_response = name_response.inner;
-    if name_response.clicked()
-        && let Some(mut state) = egui::collapsing_header::CollapsingState::load(ui.ctx(), state_id)
-    {
-        state.toggle(ui);
-        state.store(ui.ctx());
+        ConnStatus::Connected => {}
     }
-
-    let header_response = name_response.on_hover_text(engine);
-    if header_response.double_clicked() {
-        actions.push(Action::NewConsole(id.clone()));
-    }
-    header_response.context_menu(|ui| {
-        if ui.button("New console").clicked() {
-            actions.push(Action::NewConsole(id.clone()));
-        }
-        ui.separator();
-        if tree.status == ConnStatus::Connected {
-            if ui.button("Refresh").clicked() {
-                actions.push(Action::Refresh(id.clone()));
-            }
-            if ui.button("Disconnect").clicked() {
-                actions.push(Action::Disconnect(id.clone()));
-            }
-        } else if ui.button("Connect").clicked() {
-            actions.push(Action::Connect(id.clone()));
-        }
-        ui.separator();
-        if ui.button("Edit…").clicked() {
-            actions.push(Action::EditSource(id.clone()));
-        }
-    });
-}
-
-fn loading_row(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.spinner();
-        ui.weak("Loading…");
-    });
-}
-
-fn schemas(
-    ui: &mut egui::Ui,
-    source: &str,
-    schemas: &mut Loadable<Vec<SchemaNode>>,
-    filter: &str,
-    actions: &mut Vec<Action>,
-) {
-    match schemas {
+    let schemas = match &mut tree.schemas {
         Loadable::NotLoaded => {
-            *schemas = Loadable::Loading;
+            tree.schemas = Loadable::Loading;
             actions.push(Action::LoadSchemas(source.to_string()));
+            return;
         }
-        Loadable::Loading => loading_row(ui),
+        Loadable::Loading => return spinner_row(ui, "Loading…"),
         Loadable::Failed(e) => {
-            ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+            ui.colored_label(color::DANGER, e.as_str());
+            return;
         }
-        Loadable::Loaded(nodes) => {
-            let only_one = nodes.len() == 1;
-            let searching = !filter.is_empty();
-            for node in nodes.iter_mut() {
-                if searching && matches!(node.relations, Loadable::NotLoaded) {
-                    node.relations = Loadable::Loading;
-                    actions.push(Action::LoadRelations(source.to_string(), node.name.clone()));
-                }
-                if searching && !schema_matches(node, filter) {
-                    continue;
-                }
-                egui::CollapsingHeader::new(&node.name)
-                    .id_salt(("schema", source, &node.name))
-                    .default_open(only_one)
-                    .open(searching.then_some(true))
-                    .show(ui, |ui| relations(ui, source, &node.name, &mut node.relations, filter, actions));
-            }
-            if searching && !nodes.iter().any(|n| schema_matches(n, filter)) {
-                ui.weak("No matching tables");
-            }
-        }
-    }
-}
-
-fn relations(
-    ui: &mut egui::Ui,
-    source: &str,
-    schema: &str,
-    relations: &mut Loadable<Vec<RelationNode>>,
-    filter: &str,
-    actions: &mut Vec<Action>,
-) {
-    match relations {
+        Loadable::Loaded(schemas) => schemas,
+    };
+    let index = state.schema.and_then(|name| schemas.iter().position(|s| s.name == name)).unwrap_or(0);
+    let Some(node) = schemas.get_mut(index) else {
+        ui.label(RichText::new("No schemas").color(color::TEXT_WEAK));
+        return;
+    };
+    let relations = match &mut node.relations {
         Loadable::NotLoaded => {
-            *relations = Loadable::Loading;
-            actions.push(Action::LoadRelations(source.to_string(), schema.to_string()));
+            node.relations = Loadable::Loading;
+            actions.push(Action::LoadRelations(source.to_string(), node.name.clone()));
+            return;
         }
-        Loadable::Loading => loading_row(ui),
+        Loadable::Loading => return spinner_row(ui, "Loading…"),
         Loadable::Failed(e) => {
-            ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+            ui.colored_label(color::DANGER, e.as_str());
+            return;
         }
-        Loadable::Loaded(nodes) if nodes.is_empty() => {
-            ui.weak("(empty)");
+        Loadable::Loaded(rels) => rels,
+    };
+    let schema = node.name.clone();
+    for (title, kinds, glyph) in [
+        ("Tables", &[RelationKind::Table][..], icon::TABLE),
+        ("Views", &[RelationKind::View, RelationKind::MaterializedView][..], icon::EYE),
+    ] {
+        let shown: Vec<&Relation> =
+            relations.iter().filter(|r| kinds.contains(&r.kind) && find_match(&r.name, filter).is_some()).collect();
+        if shown.is_empty() && !filter.is_empty() {
+            continue;
         }
-        Loadable::Loaded(nodes) => {
-            for (label, kinds) in [
-                ("tables", vec![RelationKind::Table]),
-                ("views", vec![RelationKind::View, RelationKind::MaterializedView]),
-            ] {
-                let shown = |n: &RelationNode| {
-                    kinds.contains(&n.relation.kind) && find_match(&n.relation.name, filter).is_some()
-                };
-                let count = nodes.iter().filter(|n| shown(n)).count();
-                if count == 0 {
-                    continue;
-                }
-                egui::CollapsingHeader::new(format!("{label}  {count}"))
-                    .id_salt(("group", source, schema, label))
-                    .default_open(true)
-                    .open((!filter.is_empty()).then_some(true))
-                    .show(ui, |ui| {
-                        for node in nodes.iter_mut().filter(|n| shown(n)) {
-                            relation_node(ui, source, schema, node, filter, actions);
-                        }
-                    });
-            }
-        }
-    }
-}
-
-fn relation_node(
-    ui: &mut egui::Ui,
-    source: &str,
-    schema: &str,
-    node: &mut RelationNode,
-    filter: &str,
-    actions: &mut Vec<Action>,
-) {
-    let name = node.relation.name.clone();
-    let open_table =
-        || Action::OpenTable { source: source.to_string(), schema: schema.to_string(), table: name.clone() };
-    let response = egui::CollapsingHeader::new(highlighted(ui, &name, filter))
-        .id_salt(("relation", source, schema, &name))
-        .show(ui, |ui| match &mut node.details {
-            Loadable::NotLoaded => {
-                node.details = Loadable::Loading;
-                actions.push(Action::LoadDetails(source.to_string(), schema.to_string(), name.clone()));
-            }
-            Loadable::Loading => loading_row(ui),
-            Loadable::Failed(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, e.as_str());
-            }
-            Loadable::Loaded(details) => table_details(ui, details),
-        })
-        .header_response;
-    if response.double_clicked() {
-        actions.push(open_table());
-    }
-    response.on_hover_text("Double-click to open data").context_menu(|ui| {
-        if ui.button("Open data").clicked() {
-            actions.push(open_table());
-        }
-        if ui.button("Show DDL").clicked() {
-            actions.push(Action::ShowDdl {
-                source: source.to_string(),
-                schema: schema.to_string(),
-                table: name.clone(),
+        section_header(ui, title, Some(shown.len()));
+        for rel in shown {
+            let selected = state.active_table == Some((schema.as_str(), rel.name.as_str()));
+            let response = row(ui, selected, |ui| {
+                ui.label(RichText::new(glyph).color(if selected { color::ACCENT_TEXT } else { color::TEXT_WEAK }));
+                ui.label(highlighted(&rel.name, filter, selected));
             });
-        }
-    });
-}
-
-fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
-    ui.label(RichText::new(text).small().strong().color(color))
-}
-
-fn table_details(ui: &mut egui::Ui, d: &TableDetails) {
-    let pk_color = egui::Color32::from_rgb(214, 160, 40);
-    let fk_color = egui::Color32::from_rgb(70, 140, 220);
-    egui::CollapsingHeader::new(format!("columns  {}", d.columns.len()))
-        .id_salt(("columns", &d.schema, &d.name))
-        .default_open(true)
-        .show(ui, |ui| {
-            for col in &d.columns {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(&col.name);
-                    ui.weak(format!("{}{}", col.data_type, if col.nullable { "" } else { " not null" }));
-                    if col.pk_position.is_some() {
-                        badge(ui, "PK", pk_color);
-                    }
-                    if let Some(fk) = d.foreign_key_for(&col.name) {
-                        badge(ui, "FK", fk_color).on_hover_text(format!(
-                            "references {}.{} ({})",
-                            fk.ref_schema,
-                            fk.ref_table,
-                            fk.ref_columns.join(", ")
-                        ));
-                    }
-                });
+            let open =
+                || Action::OpenTable { source: source.to_string(), schema: schema.clone(), table: rel.name.clone() };
+            if response.clicked() {
+                actions.push(open());
             }
-        });
-    if !d.foreign_keys.is_empty() {
-        egui::CollapsingHeader::new(format!("foreign keys  {}", d.foreign_keys.len()))
-            .id_salt(("fks", &d.schema, &d.name))
-            .show(ui, |ui| {
-                for fk in &d.foreign_keys {
-                    ui.label(format!(
-                        "{} ({}) -> {}.{} ({})",
-                        fk.name,
-                        fk.columns.join(", "),
-                        fk.ref_schema,
-                        fk.ref_table,
-                        fk.ref_columns.join(", ")
-                    ));
+            response.context_menu(|ui| {
+                if ui.button("Open data").clicked() {
+                    actions.push(open());
                 }
-            });
-    }
-    if !d.indexes.is_empty() {
-        egui::CollapsingHeader::new(format!("indexes  {}", d.indexes.len()))
-            .id_salt(("indexes", &d.schema, &d.name))
-            .show(ui, |ui| {
-                for idx in &d.indexes {
-                    let kind = if idx.primary {
-                        " primary"
-                    } else if idx.unique {
-                        " unique"
-                    } else {
-                        ""
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(&idx.name);
-                        ui.weak(format!("({}){kind}", idx.columns.join(", ")));
+                if ui.button("Show DDL").clicked() {
+                    actions.push(Action::ShowDdl {
+                        source: source.to_string(),
+                        schema: schema.clone(),
+                        table: rel.name.clone(),
                     });
                 }
             });
+        }
     }
 }

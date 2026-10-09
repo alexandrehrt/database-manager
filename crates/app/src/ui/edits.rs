@@ -32,7 +32,7 @@ impl Edits {
     pub fn set(&mut self, rs: &ResultSet, row: RowRef, col: usize, value: Value) {
         match row {
             RowRef::Existing(r) => {
-                if rs.rows[r][col] == value {
+                if same_value(&rs.rows[r][col], &value) {
                     self.updates.remove(&(r, col));
                 } else {
                     self.updates.insert((r, col), value);
@@ -40,6 +40,18 @@ impl Edits {
             }
             RowRef::New(i) => self.inserts[i][col] = Some(value),
         }
+    }
+}
+
+/// Whether an edited value is just the original again: typed text that
+/// reads the same, or a checkbox matching SQLite's 0/1 booleans.
+fn same_value(original: &Value, edited: &Value) -> bool {
+    match (original, edited) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (o, Value::Text(t)) => o.to_string() == *t,
+        (Value::Int(i), Value::Bool(b)) | (Value::Bool(b), Value::Int(i)) => *i == *b as i64,
+        (o, e) => o == e,
     }
 }
 

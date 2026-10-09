@@ -6,13 +6,16 @@ use std::time::Instant;
 use dbm_core::config::DataSourceConfig;
 use dbm_core::fk_nav::ForeignKeyIndex;
 use dbm_core::{ExecOutcome, TableDetails};
-use eframe::egui;
+use eframe::egui::{self, Color32, RichText, Stroke};
 
 use crate::persist;
-use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TableView, TxMode};
+use crate::ui::console::{
+    Console, ConsoleAction, ConsoleContext, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TableView, TxMode, ViewMode,
+};
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
-use crate::ui::explorer::{self, ConnStatus, Loadable, RelationNode, SchemaNode, SourceTree};
+use crate::ui::explorer::{self, ConnStatus, Loadable, SchemaNode, SidebarState, SourceTree};
 use crate::ui::goto::{Candidate, GotoOutcome, GotoTable};
+use crate::ui::theme::{self, color, icon};
 use crate::worker::{Event, Worker};
 
 /// Something the UI asked for while drawing; applied after the frame's UI
@@ -20,12 +23,13 @@ use crate::worker::{Event, Worker};
 pub enum Action {
     NewSource,
     EditSource(String),
+    SelectSource(String),
+    SelectSchema(String, String),
     Connect(String),
     Disconnect(String),
     Refresh(String),
     LoadSchemas(String),
     LoadRelations(String, String),
-    LoadDetails(String, String, String),
     NewConsole(String),
     OpenTable { source: String, schema: String, table: String },
     ShowDdl { source: String, schema: String, table: String },
@@ -35,22 +39,9 @@ const HISTORY_LIMIT: usize = 200;
 
 const NEW_SOURCE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
 const NEW_CONSOLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
-const GOTO_TABLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+const GOTO_TABLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
+const GOTO_TABLE_ALT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
 const CLOSE_TAB: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
-
-enum Tab {
-    Console(Box<Console>),
-    Ddl { id: u64, title: String, text: Loadable<String> },
-}
-
-impl Tab {
-    fn title(&self) -> &str {
-        match self {
-            Tab::Console(c) => &c.title,
-            Tab::Ddl { title, .. } => title,
-        }
-    }
-}
 
 /// A run requested before its data source finished connecting.
 struct PendingRun {
@@ -75,9 +66,14 @@ pub struct App {
     dialog: Option<DataSourceDialog>,
     next_test_nonce: u64,
     status: Option<String>,
-    tabs: Vec<Tab>,
+    tabs: Vec<Console>,
     active_tab: usize,
     next_id: u64,
+    console_count: u64,
+    /// The data source the sidebar shows.
+    current_source: Option<String>,
+    /// Schema the sidebar shows, per data source.
+    schema_choice: HashMap<String, String>,
     history: HashMap<String, Vec<String>>,
     /// Runs waiting for their console's connection, by console id.
     pending_runs: HashMap<u64, Vec<PendingRun>>,
@@ -85,25 +81,30 @@ pub struct App {
     quit_confirmed: bool,
     /// Foreign keys per data source, filled from table details as results need them.
     fk_cache: HashMap<String, ForeignKeyIndex>,
-    /// Table details per data source, for deciding whether results are editable.
+    /// Table details per data source, for editing, the grid and the Structure view.
     table_cache: HashMap<String, HashMap<(String, String), TableDetails>>,
     /// Foreign keys pointing at each table, per data source, for "Referencing rows".
     incoming_cache: HashMap<String, HashMap<(String, String), Vec<dbm_core::IncomingKey>>>,
-    /// Last WHERE / ORDER BY per (source, schema, table), for this session.
-    table_filters: HashMap<(String, String, String), (String, String)>,
-    explorer_filter: String,
+    /// Last filters / ORDER BY per (source, schema, table), for this session.
+    table_filters: HashMap<(String, String, String), (Vec<String>, String)>,
+    sidebar_filter: String,
     goto: Option<GotoTable>,
     fk_pending: HashSet<(String, String, String)>,
+    /// Consoles whose DDL is being fetched.
+    ddl_pending: HashSet<u64>,
+    window_title: String,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::install(&cc.egui_ctx);
         let (sources, status) = match persist::load_sources() {
             Ok(s) => (s, None),
             Err(e) => (Vec::new(), Some(format!("Could not load saved data sources: {e:#}"))),
         };
         Self {
             worker: Worker::new(cc.egui_ctx.clone()),
+            current_source: sources.first().map(|s| s.id.clone()),
             sources,
             trees: HashMap::new(),
             session_passwords: HashMap::new(),
@@ -113,6 +114,8 @@ impl App {
             tabs: Vec::new(),
             active_tab: 0,
             next_id: 1,
+            console_count: 0,
+            schema_choice: HashMap::new(),
             history: persist::load_history(),
             pending_runs: HashMap::new(),
             confirm: None,
@@ -121,9 +124,11 @@ impl App {
             table_cache: HashMap::new(),
             incoming_cache: HashMap::new(),
             table_filters: HashMap::new(),
-            explorer_filter: String::new(),
+            sidebar_filter: String::new(),
             goto: None,
             fk_pending: HashSet::new(),
+            ddl_pending: HashSet::new(),
+            window_title: String::new(),
         }
     }
 
@@ -147,23 +152,29 @@ impl App {
     }
 
     fn console_mut(&mut self, id: u64) -> Option<&mut Console> {
-        self.tabs.iter_mut().find_map(|t| match t {
-            Tab::Console(c) if c.id == id => Some(c.as_mut()),
-            _ => None,
-        })
+        self.tabs.iter_mut().find(|c| c.id == id)
     }
 
-    fn open_tab(&mut self, tab: Tab) {
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+    fn active(&self) -> Option<&Console> {
+        self.tabs.get(self.active_tab)
+    }
+
+    fn activate(&mut self, i: usize) {
+        self.active_tab = i;
+        if let Some(c) = self.tabs.get(i) {
+            self.current_source = Some(c.source.clone());
+        }
     }
 
     fn new_console(&mut self, source: &str, title: Option<String>, sql: String) -> Option<u64> {
-        let config = self.source(source)?;
-        let (dialect, name) = (config.kind.dialect(), config.name.clone());
+        let dialect = self.source(source)?.kind.dialect();
         let id = self.next_id();
-        let title = title.unwrap_or_else(|| format!("console [{name}]"));
-        self.open_tab(Tab::Console(Box::new(Console::new(id, source.to_string(), title, dialect, sql))));
+        let title = title.unwrap_or_else(|| {
+            self.console_count += 1;
+            format!("console {}", self.console_count)
+        });
+        self.tabs.push(Console::new(id, source.to_string(), title, dialect, sql));
+        self.activate(self.tabs.len() - 1);
         Some(id)
     }
 
@@ -227,13 +238,6 @@ impl App {
         }
     }
 
-    fn consoles(&self) -> impl Iterator<Item = &Console> {
-        self.tabs.iter().filter_map(|t| match t {
-            Tab::Console(c) => Some(c.as_ref()),
-            _ => None,
-        })
-    }
-
     /// Closes the explorer connection and every console connection of a source;
     /// the server rolls back their open transactions.
     fn disconnect_source(&mut self, id: &str) {
@@ -242,7 +246,7 @@ impl App {
         self.incoming_cache.remove(id);
         self.worker.disconnect(id);
         self.trees.remove(id);
-        let consoles: Vec<u64> = self.consoles().filter(|c| c.source == id).map(|c| c.id).collect();
+        let consoles: Vec<u64> = self.tabs.iter().filter(|c| c.source == id).map(|c| c.id).collect();
         for console in consoles {
             self.worker.close_console(console);
             self.pending_runs.remove(&console);
@@ -257,37 +261,39 @@ impl App {
 
     /// Requests foreign keys for every table a result set read from.
     fn load_foreign_keys(&mut self, source: &str, console: u64, rs: &dbm_core::ResultSet) {
-        // Prefer the explorer connection; a console in an aborted transaction can't run catalog queries.
-        let Some(conn) = self.worker.connection(source).or_else(|| self.worker.console_connection(console)) else {
-            return;
-        };
         let tables: HashSet<(String, String)> =
             rs.columns.iter().filter_map(|c| c.origin.as_ref()).map(|o| (o.schema.clone(), o.table.clone())).collect();
         for (schema, table) in tables {
-            let cached =
-                self.fk_cache.get(source).is_some_and(|idx| idx.contains_key(&(schema.clone(), table.clone())));
-            let key = (source.to_string(), schema.clone(), table.clone());
-            if cached || !self.fk_pending.insert(key) {
-                continue;
-            }
-            self.worker.incoming(conn.clone(), source.to_string(), schema.clone(), table.clone());
-            self.worker.details(conn.clone(), source.to_string(), schema, table);
+            self.request_details(source, console, schema, table);
         }
     }
 
-    /// Loads a table's details (columns, keys) for completion, once.
+    /// Loads a table's details (columns, keys) and incoming keys, once.
     fn request_details(&mut self, source: &str, console: u64, schema: String, table: String) {
         let cached = self.table_cache.get(source).is_some_and(|m| m.contains_key(&(schema.clone(), table.clone())));
         let key = (source.to_string(), schema.clone(), table.clone());
         if cached || self.fk_pending.contains(&key) {
             return;
         }
+        // Prefer the explorer connection; a console in an aborted transaction can't run catalog queries.
         let Some(conn) = self.worker.connection(source).or_else(|| self.worker.console_connection(console)) else {
             return;
         };
         self.fk_pending.insert(key);
         self.worker.incoming(conn.clone(), source.to_string(), schema.clone(), table.clone());
         self.worker.details(conn, source.to_string(), schema, table);
+    }
+
+    fn request_ddl(&mut self, console: u64) {
+        let Some(c) = self.tabs.iter().find(|c| c.id == console) else { return };
+        let Some(tv) = &c.table else { return };
+        let (source, schema, table) = (c.source.clone(), tv.schema.clone(), tv.table.clone());
+        let Some(conn) = self.worker.connection(&source).or_else(|| self.worker.console_connection(console)) else {
+            return;
+        };
+        if self.ddl_pending.insert(console) {
+            self.worker.spawn(async move { Event::Ddl { tab: console, result: conn.ddl(&schema, &table).await } });
+        }
     }
 
     /// (schema, table) of every loaded table and view of a source.
@@ -298,7 +304,7 @@ impl App {
         schemas
             .iter()
             .filter_map(|s| match &s.relations {
-                Loadable::Loaded(rels) => Some(rels.iter().map(|r| (s.name.clone(), r.relation.name.clone()))),
+                Loadable::Loaded(rels) => Some(rels.iter().map(|r| (s.name.clone(), r.name.clone()))),
                 _ => None,
             })
             .flatten()
@@ -309,38 +315,30 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
-        if let Tab::Console(c) = &self.tabs[i] {
-            if let Some(run) = &c.run {
-                run.stop.store(true, Ordering::Relaxed);
-            }
-            let id = c.id;
-            self.worker.close_console(id);
-            self.pending_runs.remove(&id);
+        let c = &self.tabs[i];
+        if let Some(run) = &c.run {
+            run.stop.store(true, Ordering::Relaxed);
         }
+        let id = c.id;
+        self.worker.close_console(id);
+        self.pending_runs.remove(&id);
         self.tabs.remove(i);
-        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        let next = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        self.activate(next);
     }
 
     /// Closes tab `i`, first asking if its console has an open transaction.
     fn request_close_tab(&mut self, i: usize) {
         match self.tabs.get(i) {
-            Some(Tab::Console(c)) if c.in_transaction => self.confirm = Some(Confirm::CloseConsole(c.id)),
+            Some(c) if c.in_transaction => self.confirm = Some(Confirm::CloseConsole(c.id)),
             Some(_) => self.close_tab(i),
             None => {}
         }
     }
 
-    /// The data source a new console should use: the active console's, else the first one.
-    fn current_source(&self) -> Option<String> {
-        match self.tabs.get(self.active_tab) {
-            Some(Tab::Console(c)) => Some(c.source.clone()),
-            _ => self.sources.first().map(|s| s.id.clone()),
-        }
-    }
-
     /// Requests whatever schemas and relations of connected sources aren't
-    /// loaded yet, so the Go to table picker can search them. Returns
-    /// whether anything is still loading.
+    /// loaded yet, so the Go to table picker and completion can search them.
+    /// Returns whether anything is still loading.
     fn load_all_tables(&mut self) -> bool {
         let mut loading = false;
         let mut actions = Vec::new();
@@ -389,8 +387,8 @@ impl App {
                         source: source.id.clone(),
                         source_name: source.name.clone(),
                         schema: schema.name.clone(),
-                        table: r.relation.name.clone(),
-                        is_view: r.relation.kind != dbm_core::RelationKind::Table,
+                        table: r.name.clone(),
+                        is_view: r.kind != dbm_core::RelationKind::Table,
                     }));
                 }
             }
@@ -425,6 +423,34 @@ impl App {
         entries.retain(|q| q != sql);
         entries.insert(0, sql.to_string());
         entries.truncate(HISTORY_LIMIT);
+    }
+
+    /// Opens a table's tab in `mode`, reusing an open one.
+    fn open_table(&mut self, source: String, schema: String, table: String, mode: ViewMode) {
+        let existing = self.tabs.iter().position(|c| {
+            c.source == source && c.table.as_ref().is_some_and(|t| t.schema == schema && t.table == table)
+        });
+        if let Some(i) = existing {
+            self.activate(i);
+            if let Some(tv) = &mut self.tabs[i].table {
+                tv.mode = mode;
+            }
+            return;
+        }
+        let Some(dialect) = self.source(&source).map(|s| s.kind.dialect()) else { return };
+        let (filters, order) =
+            self.table_filters.get(&(source.clone(), schema.clone(), table.clone())).cloned().unwrap_or_default();
+        let mut view = TableView::new(schema.clone(), table.clone(), filters, order);
+        view.mode = mode;
+        let sql = view.sql(dialect);
+        if let Some(id) = self.new_console(&source, Some(table.clone()), sql.clone()) {
+            if let Some(c) = self.console_mut(id) {
+                c.table = Some(view);
+            }
+            self.schema_choice.insert(source.clone(), schema.clone());
+            self.request_details(&source, id, schema, table);
+            self.start_run(id, vec![(sql, Vec::new())], PAGE_SIZE, RunMode::Filter);
+        }
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -565,15 +591,11 @@ impl App {
                 }
             }
             Event::Ddl { tab, result } => {
-                for t in &mut self.tabs {
-                    if let Tab::Ddl { id, text, .. } = t
-                        && *id == tab
-                    {
-                        *text = match &result {
-                            Ok(ddl) => Loadable::Loaded(ddl.clone()),
-                            Err(e) => Loadable::Failed(e.to_string()),
-                        };
-                    }
+                self.ddl_pending.remove(&tab);
+                if let Some(c) = self.console_mut(tab)
+                    && let Some(tv) = &mut c.table
+                {
+                    tv.ddl = Some(result.map_err(|e| e.to_string()));
                 }
             }
             Event::Tested { nonce, result } => {
@@ -596,36 +618,19 @@ impl App {
                     && let Some(node) = schemas.iter_mut().find(|s| s.name == schema)
                 {
                     node.relations = match result {
-                        Ok(rels) => Loadable::Loaded(
-                            rels.into_iter()
-                                .map(|relation| RelationNode { relation, details: Loadable::NotLoaded })
-                                .collect(),
-                        ),
+                        Ok(rels) => Loadable::Loaded(rels),
                         Err(e) => Loadable::Failed(e.to_string()),
                     };
                 }
             }
             Event::Details { source, schema, table, result } => {
                 self.fk_pending.remove(&(source.clone(), schema.clone(), table.clone()));
-                if let Ok(d) = &result {
+                if let Ok(d) = result {
                     self.fk_cache
                         .entry(source.clone())
                         .or_default()
                         .insert((schema.clone(), table.clone()), d.foreign_keys.clone());
-                    self.table_cache
-                        .entry(source.clone())
-                        .or_default()
-                        .insert((schema.clone(), table.clone()), d.clone());
-                }
-                if let Loadable::Loaded(schemas) = &mut self.tree(&source).schemas
-                    && let Some(node) = schemas.iter_mut().find(|s| s.name == schema)
-                    && let Loadable::Loaded(rels) = &mut node.relations
-                    && let Some(rel) = rels.iter_mut().find(|r| r.relation.name == table)
-                {
-                    rel.details = match result {
-                        Ok(d) => Loadable::Loaded(d),
-                        Err(e) => Loadable::Failed(e.to_string()),
-                    };
+                    self.table_cache.entry(source).or_default().insert((schema, table), d);
                 }
             }
         }
@@ -639,6 +644,10 @@ impl App {
                     self.dialog = Some(DataSourceDialog::edit(s));
                 }
             }
+            Action::SelectSource(id) => self.current_source = Some(id),
+            Action::SelectSchema(source, schema) => {
+                self.schema_choice.insert(source, schema);
+            }
             Action::Connect(id) => {
                 if let Some(config) = self.source(&id).cloned() {
                     let password = self.session_passwords.get(&id).cloned();
@@ -647,7 +656,7 @@ impl App {
                 }
             }
             Action::Disconnect(id) => {
-                if self.consoles().any(|c| c.source == id && c.in_transaction) {
+                if self.tabs.iter().any(|c| c.source == id && c.in_transaction) {
                     self.confirm = Some(Confirm::Disconnect(id));
                 } else {
                     self.disconnect_source(&id);
@@ -675,36 +684,8 @@ impl App {
             Action::NewConsole(source) => {
                 self.new_console(&source, None, String::new());
             }
-            Action::OpenTable { source, schema, table } => {
-                let Some(dialect) = self.source(&source).map(|s| s.kind.dialect()) else { return };
-                let (filter, order) = self
-                    .table_filters
-                    .get(&(source.clone(), schema.clone(), table.clone()))
-                    .cloned()
-                    .unwrap_or_default();
-                let view = TableView::new(schema, table.clone(), filter, order);
-                let sql = view.sql(dialect);
-                if let Some(id) = self.new_console(&source, Some(table), sql.clone()) {
-                    if let Some(c) = self.console_mut(id) {
-                        c.table = Some(view);
-                    }
-                    self.start_run(id, vec![(sql, Vec::new())], PAGE_SIZE, RunMode::Filter);
-                }
-            }
-            Action::ShowDdl { source, schema, table } => {
-                let id = self.next_id();
-                self.open_tab(Tab::Ddl { id, title: format!("DDL {table}"), text: Loadable::Loading });
-                self.worker.with_connection(&source, |conn| async move {
-                    Event::Ddl { tab: id, result: conn.ddl(&schema, &table).await }
-                });
-            }
-            Action::LoadDetails(source, schema, table) => {
-                let s = source.clone();
-                self.worker.with_connection(&source, |conn| async move {
-                    let result = conn.table_details(&schema, &table).await;
-                    Event::Details { source: s, schema, table, result }
-                });
-            }
+            Action::OpenTable { source, schema, table } => self.open_table(source, schema, table, ViewMode::Content),
+            Action::ShowDdl { source, schema, table } => self.open_table(source, schema, table, ViewMode::Sql),
         }
     }
 
@@ -741,8 +722,9 @@ impl App {
                     None => self.sources.push(config),
                 }
                 self.persist_sources();
-                // Settings may have changed, so the next expand reconnects.
+                // Settings may have changed, so the next use reconnects.
                 self.disconnect_source(&id);
+                self.current_source = Some(id);
                 self.dialog = None;
             }
             DialogAction::Delete(id) => {
@@ -751,7 +733,57 @@ impl App {
                 persist::delete_password(&id);
                 self.session_passwords.remove(&id);
                 self.disconnect_source(&id);
+                if self.current_source.as_deref() == Some(id.as_str()) {
+                    self.current_source = self.sources.first().map(|s| s.id.clone());
+                }
                 self.dialog = None;
+            }
+        }
+    }
+
+    fn apply_console(&mut self, console: u64, action: ConsoleAction) {
+        match action {
+            ConsoleAction::Run { statements, limit, mode } => {
+                if matches!(mode, RunMode::Filter)
+                    && let Some(c) = self.console_mut(console)
+                    && let Some(tv) = &c.table
+                {
+                    let key = (c.source.clone(), tv.schema.clone(), tv.table.clone());
+                    let value = (tv.filters.clone(), tv.order.clone());
+                    self.table_filters.insert(key, value);
+                }
+                self.start_run(console, statements, limit, mode)
+            }
+            ConsoleAction::Cancel => {
+                if let Some(c) = self.console_mut(console)
+                    && let Some(run) = &c.run
+                {
+                    run.stop.store(true, Ordering::Relaxed);
+                    if let Some(conn) = self.worker.console_connection(console) {
+                        self.worker.cancel(conn);
+                    }
+                }
+            }
+            ConsoleAction::SubmitEdits { tab, statements } => {
+                if let Some(conn) = self.worker.console_connection(console)
+                    && let Some(c) = self.console_mut(console)
+                    && let Some(t) = c.results.get_mut(tab)
+                {
+                    t.submitting = true;
+                    t.edit_error = None;
+                    t.editing = None;
+                    self.worker.submit_edits(conn, console, tab, statements);
+                }
+            }
+            ConsoleAction::Commit | ConsoleAction::Rollback => {
+                let sql = if matches!(action, ConsoleAction::Commit) { "COMMIT" } else { "ROLLBACK" };
+                if let Some(conn) = self.worker.console_connection(console)
+                    && let Some(c) = self.console_mut(console)
+                {
+                    c.tx_busy = true;
+                    c.tx_notice = None;
+                    self.worker.control(conn, console, sql);
+                }
             }
         }
     }
@@ -766,19 +798,20 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut actions = Vec::new();
+        let mut console_actions = Vec::new();
         let mut close_active = false;
         if ui.ctx().input(|i| i.viewport().close_requested())
             && !self.quit_confirmed
-            && self.consoles().any(|c| c.in_transaction)
+            && self.tabs.iter().any(|c| c.in_transaction)
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Quit);
         }
         if self.dialog.is_none() && self.confirm.is_none() && self.goto.is_none() {
-            if ui.input_mut(|i| i.consume_shortcut(&GOTO_TABLE)) {
-                self.goto = Some(GotoTable::default());
-            }
             ui.input_mut(|i| {
+                if i.consume_shortcut(&GOTO_TABLE) || i.consume_shortcut(&GOTO_TABLE_ALT) {
+                    self.goto = Some(GotoTable::default());
+                }
                 if i.consume_shortcut(&NEW_SOURCE) {
                     actions.push(Action::NewSource);
                 }
@@ -786,57 +819,27 @@ impl eframe::App for App {
                     close_active = true;
                 }
                 if i.consume_shortcut(&NEW_CONSOLE)
-                    && let Some(source) = self.current_source()
+                    && let Some(source) = self.current_source.clone()
                 {
                     actions.push(Action::NewConsole(source));
                 }
             });
         }
+        self.update_window_title(ui.ctx());
 
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    let ctx = ui.ctx().clone();
-                    if ui
-                        .add(egui::Button::new("New data source…").shortcut_text(ctx.format_shortcut(&NEW_SOURCE)))
-                        .clicked()
-                    {
-                        actions.push(Action::NewSource);
-                    }
-                    let source = self.current_source();
-                    if ui
-                        .add_enabled(
-                            source.is_some(),
-                            egui::Button::new("New console").shortcut_text(ctx.format_shortcut(&NEW_CONSOLE)),
-                        )
-                        .clicked()
-                        && let Some(source) = source
-                    {
-                        actions.push(Action::NewConsole(source));
-                    }
-                    if ui
-                        .add(egui::Button::new("Go to table…").shortcut_text(ctx.format_shortcut(&GOTO_TABLE)))
-                        .clicked()
-                    {
-                        self.goto = Some(GotoTable::default());
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.tabs.is_empty(),
-                            egui::Button::new("Close tab").shortcut_text(ctx.format_shortcut(&CLOSE_TAB)),
-                        )
-                        .clicked()
-                    {
-                        close_active = true;
-                    }
-                });
-            });
-        });
+        egui::Panel::top("topbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(color::BG)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .stroke(Stroke::new(1.0, color::BORDER)),
+            )
+            .show(ui, |ui| self.top_bar(ui, &mut actions, &mut console_actions));
 
         if let Some(status) = self.status.clone() {
             egui::Panel::bottom("status").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(ui.visuals().warn_fg_color, status);
+                    ui.colored_label(color::WARNING, status);
                     if ui.small_button("Dismiss").clicked() {
                         self.status = None;
                     }
@@ -844,19 +847,34 @@ impl eframe::App for App {
             });
         }
 
-        egui::Panel::left("explorer").resizable(true).default_size(300.0).min_size(180.0).show(ui, |ui| {
-            explorer::show(ui, &self.sources, &mut self.trees, &mut self.explorer_filter, &mut actions);
-        });
+        egui::Panel::left("sidebar")
+            .resizable(true)
+            .default_size(230.0)
+            .min_size(180.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(color::BG_SUBTLE)
+                    .inner_margin(egui::Margin::symmetric(10, 10))
+                    .stroke(Stroke::new(1.0, color::BORDER)),
+            )
+            .show(ui, |ui| {
+                let current = self.current_source.clone();
+                let active_table = self
+                    .active()
+                    .filter(|c| Some(&c.source) == current.as_ref())
+                    .and_then(|c| c.table.as_ref())
+                    .map(|t| (t.schema.clone(), t.table.clone()));
+                let schema = current.as_ref().and_then(|s| self.schema_choice.get(s)).cloned();
+                let state = SidebarState {
+                    current: current.as_deref(),
+                    schema: schema.as_deref(),
+                    active_table: active_table.as_ref().map(|(s, t)| (s.as_str(), t.as_str())),
+                };
+                explorer::show(ui, &self.sources, &mut self.trees, state, &mut self.sidebar_filter, &mut actions);
+            });
 
-        let mut console_actions = Vec::new();
-        let no_fks = ForeignKeyIndex::new();
-        let no_tables = HashMap::new();
-        let no_incoming = HashMap::new();
         // Completion needs the active console's tables; load them in the background.
-        let active_source = match self.tabs.get(self.active_tab) {
-            Some(Tab::Console(c)) => Some(c.source.clone()),
-            _ => None,
-        };
+        let active_source = self.active().map(|c| c.source.clone());
         if active_source.is_some() {
             self.load_all_tables();
         }
@@ -865,113 +883,88 @@ impl eframe::App for App {
             Some(dbm_core::Dialect::Sqlite) => "main",
             _ => "public",
         };
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.tabs.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("Double-click a data source to open a console, or a table to see its data.");
-                });
-                return;
-            }
+        let no_fks = ForeignKeyIndex::new();
+        let no_tables = HashMap::new();
+        let no_incoming = HashMap::new();
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(color::BG)).show(ui, |ui| {
             let mut close = None;
-            ui.horizontal_wrapped(|ui| {
-                for (i, tab) in self.tabs.iter().enumerate() {
+            let mut activate = None;
+            egui::Panel::top("tabstrip")
+                .frame(
+                    egui::Frame::new()
+                        .fill(color::BG_SUBTLE)
+                        .inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 0 })
+                        .stroke(Stroke::new(1.0, color::BORDER)),
+                )
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        let in_tx = matches!(tab, Tab::Console(c) if c.in_transaction);
-                        let title = if in_tx { format!("{} (tx)", tab.title()) } else { tab.title().to_string() };
-                        if ui.selectable_label(self.active_tab == i, title).clicked() {
-                            self.active_tab = i;
+                        for (i, c) in self.tabs.iter().enumerate() {
+                            match tab_button(ui, c, i == self.active_tab) {
+                                TabClick::Activate => activate = Some(i),
+                                TabClick::Close => close = Some(i),
+                                TabClick::None => {}
+                            }
                         }
-                        if ui.small_button("x").on_hover_text("Close tab").clicked() {
-                            close = Some(i);
+                        if let Some(source) = self.current_source.clone()
+                            && ui.add(theme::flat_button(icon::PLUS)).on_hover_text("New console (Cmd+T)").clicked()
+                        {
+                            actions.push(Action::NewConsole(source));
                         }
                     });
-                }
-            });
-            ui.separator();
+                });
+            if let Some(i) = activate {
+                self.activate(i);
+            }
             if let Some(i) = close {
                 self.request_close_tab(i);
                 return;
             }
-            let active = self.active_tab.min(self.tabs.len() - 1);
-            match &mut self.tabs[active] {
-                Tab::Console(c) => {
-                    let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
-                    let fks = self.fk_cache.get(&c.source).unwrap_or(&no_fks);
-                    let tables = self.table_cache.get(&c.source).unwrap_or(&no_tables);
-                    let incoming = self.incoming_cache.get(&c.source).unwrap_or(&no_incoming);
-                    let catalog =
-                        crate::ui::completion::Catalog { tables: &catalog_tables, details: tables, default_schema };
-                    if let Some(a) = c.show(ui, history, fks, tables, incoming, &catalog) {
-                        console_actions.push((c.id, a));
-                    }
-                }
-                Tab::Ddl { text, .. } => ddl_view(ui, text),
+            let Some(c) = self.tabs.get_mut(self.active_tab) else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Pick a table in the sidebar, press Cmd+K to find one, or + for a console.")
+                            .color(color::TEXT_WEAK),
+                    );
+                });
+                return;
+            };
+            let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
+            let tables = self.table_cache.get(&c.source).unwrap_or(&no_tables);
+            let catalog = crate::ui::completion::Catalog { tables: &catalog_tables, details: tables, default_schema };
+            let cx = ConsoleContext {
+                history,
+                fks: self.fk_cache.get(&c.source).unwrap_or(&no_fks),
+                tables,
+                incoming: self.incoming_cache.get(&c.source).unwrap_or(&no_incoming),
+                catalog: &catalog,
+            };
+            if let Some(a) = c.show(ui, &cx) {
+                console_actions.push((c.id, a));
             }
         });
         if close_active {
             self.request_close_tab(self.active_tab);
         }
-        let wanted: Vec<(String, u64, String, String)> = self
-            .tabs
-            .iter_mut()
-            .filter_map(|t| match t {
-                Tab::Console(c) => Some(c),
-                _ => None,
-            })
-            .flat_map(|c| {
-                let (source, id) = (c.source.clone(), c.id);
-                std::mem::take(&mut c.wanted_details).into_iter().map(move |(s, t)| (source.clone(), id, s, t))
-            })
-            .collect();
+
+        // Metadata the consoles asked for while drawing.
+        let mut wanted = Vec::new();
+        let mut ddl = Vec::new();
+        for c in &mut self.tabs {
+            let (source, id) = (c.source.clone(), c.id);
+            wanted.extend(std::mem::take(&mut c.wanted_details).into_iter().map(|(s, t)| (source.clone(), id, s, t)));
+            if std::mem::take(&mut c.wanted_ddl) {
+                ddl.push(id);
+            }
+        }
         for (source, console, schema, table) in wanted {
             self.request_details(&source, console, schema, table);
         }
+        for console in ddl {
+            self.request_ddl(console);
+        }
         for (console, action) in console_actions {
-            match action {
-                ConsoleAction::Run { statements, limit, mode } => {
-                    if matches!(mode, RunMode::Filter)
-                        && let Some(c) = self.console_mut(console)
-                        && let Some(tv) = &c.table
-                    {
-                        let key = (c.source.clone(), tv.schema.clone(), tv.table.clone());
-                        let value = (tv.filter.clone(), tv.order.clone());
-                        self.table_filters.insert(key, value);
-                    }
-                    self.start_run(console, statements, limit, mode)
-                }
-                ConsoleAction::Cancel => {
-                    if let Some(c) = self.console_mut(console)
-                        && let Some(run) = &c.run
-                    {
-                        run.stop.store(true, Ordering::Relaxed);
-                        if let Some(conn) = self.worker.console_connection(console) {
-                            self.worker.cancel(conn);
-                        }
-                    }
-                }
-                ConsoleAction::SubmitEdits { tab, statements } => {
-                    if let Some(conn) = self.worker.console_connection(console)
-                        && let Some(c) = self.console_mut(console)
-                        && let Some(t) = c.results.get_mut(tab)
-                    {
-                        t.submitting = true;
-                        t.edit_error = None;
-                        t.editing = None;
-                        self.worker.submit_edits(conn, console, tab, statements);
-                    }
-                }
-                ConsoleAction::Commit | ConsoleAction::Rollback => {
-                    let sql = if matches!(action, ConsoleAction::Commit) { "COMMIT" } else { "ROLLBACK" };
-                    if let Some(conn) = self.worker.console_connection(console)
-                        && let Some(c) = self.console_mut(console)
-                    {
-                        c.tx_busy = true;
-                        c.tx_notice = None;
-                        self.worker.control(conn, console, sql);
-                    }
-                }
-            }
+            self.apply_console(console, action);
         }
 
         self.confirm_ui(&ui.ctx().clone());
@@ -989,7 +982,263 @@ impl eframe::App for App {
     }
 }
 
+enum TabClick {
+    None,
+    Activate,
+    Close,
+}
+
+/// One tab of the strip: icon, title, a dot while edits are pending or a
+/// transaction is open, and a close button on the active or hovered tab.
+fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool) -> TabClick {
+    let glyph = if c.table.is_some() { icon::TABLE } else { icon::TERMINAL_WINDOW };
+    let mut click = TabClick::None;
+    let fill = if active { color::BG } else { Color32::TRANSPARENT };
+    let stroke = if active { Stroke::new(1.0, color::BORDER) } else { Stroke::NONE };
+    let frame = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(egui::CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 })
+        .inner_margin(egui::Margin { left: 10, right: 6, top: 6, bottom: 7 })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let tint = if active { color::ACCENT_TEXT } else { color::TEXT_WEAK };
+            ui.label(RichText::new(glyph).color(tint));
+            let title = RichText::new(&c.title);
+            ui.label(if active {
+                title.font(theme::font(13.0, theme::medium()))
+            } else {
+                title.color(color::TEXT_WEAK)
+            });
+            if c.has_pending_edits() || c.in_transaction {
+                let dot = if c.in_transaction { color::WARNING } else { color::CHANGED_EDGE };
+                ui.label(RichText::new("●").size(8.0).color(dot)).on_hover_text(if c.in_transaction {
+                    "Transaction open"
+                } else {
+                    "Unsaved changes"
+                });
+            }
+            let x = ui.add(
+                egui::Label::new(RichText::new(icon::X).size(11.0).color(color::TEXT_FAINT))
+                    .sense(egui::Sense::click()),
+            );
+            if x.on_hover_text("Close tab").clicked() {
+                click = TabClick::Close;
+            }
+        });
+    if matches!(click, TabClick::None) && frame.response.interact(egui::Sense::click()).clicked() {
+        click = TabClick::Activate;
+    }
+    click
+}
+
 impl App {
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let title = match self.active() {
+            Some(c) => match &c.table {
+                Some(tv) => {
+                    let mode = match tv.mode {
+                        ViewMode::Content => "Content",
+                        ViewMode::Structure => "Structure",
+                        ViewMode::Sql => "SQL",
+                    };
+                    format!("Table {} — {mode}", tv.table)
+                }
+                None => {
+                    let source = self.source(&c.source).map(|s| s.name.clone()).unwrap_or_default();
+                    format!("{} — {source}", c.title)
+                }
+            },
+            None => "Database Manager".into(),
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
+
+    fn top_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<Action>,
+        console_actions: &mut Vec<(u64, ConsoleAction)>,
+    ) {
+        let bar = ui.max_rect();
+        ui.horizontal(|ui| {
+            ui.set_min_height(28.0);
+            self.source_picker(ui, actions);
+            self.breadcrumb(ui, actions);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.commit_menu(ui, console_actions);
+                let ctx = ui.ctx().clone();
+                let search = egui::Button::new(
+                    RichText::new(format!("{}   Go to table…", icon::MAGNIFYING_GLASS)).color(color::TEXT_WEAK),
+                )
+                .shortcut_text(RichText::new(ctx.format_shortcut(&GOTO_TABLE)).small().color(color::TEXT_FAINT))
+                .min_size(egui::vec2(230.0, 28.0))
+                .fill(color::BG);
+                if ui.add(search).clicked() {
+                    self.goto = Some(GotoTable::default());
+                }
+            });
+        });
+
+        // Content / Structure / SQL for table tabs, centred in the bar.
+        if let Some(c) = self.tabs.get_mut(self.active_tab)
+            && let Some(tv) = &mut c.table
+        {
+            let size = egui::vec2(250.0, 28.0);
+            let rect = egui::Rect::from_center_size(bar.center(), size);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                segmented(
+                    ui,
+                    &mut tv.mode,
+                    &[(ViewMode::Content, "Content"), (ViewMode::Structure, "Structure"), (ViewMode::Sql, "SQL")],
+                );
+            });
+        }
+    }
+
+    fn source_picker(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let current = self.current_source.as_deref().and_then(|id| self.source(id));
+        let mut job = egui::text::LayoutJob::default();
+        match current {
+            Some(s) => {
+                let status = self.trees.get(&s.id).map_or(&ConnStatus::Disconnected, |t| &t.status);
+                job.append(
+                    "●  ",
+                    0.0,
+                    egui::TextFormat {
+                        color: explorer::status_color(status),
+                        font_id: theme::font(9.0, egui::FontFamily::Proportional),
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &s.name,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: theme::font(13.0, theme::semibold()),
+                        color: color::TEXT,
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &format!("  {}  {}", explorer::source_description(s), icon::CARET_DOWN),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: theme::font(12.0, egui::FontFamily::Proportional),
+                        color: color::TEXT_WEAK,
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
+                );
+            }
+            None => job.append(
+                &format!("Choose a connection  {}", icon::CARET_DOWN),
+                0.0,
+                egui::TextFormat { color: color::TEXT_WEAK, ..Default::default() },
+            ),
+        }
+        let sources: Vec<(String, String)> = self.sources.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        ui.menu_button(egui::WidgetText::from(job), |ui| {
+            for (id, name) in sources {
+                let selected = self.current_source.as_deref() == Some(id.as_str());
+                if ui.selectable_label(selected, name).clicked() {
+                    actions.push(Action::SelectSource(id));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button(format!("{}  New connection…", icon::PLUS)).clicked() {
+                actions.push(Action::NewSource);
+                ui.close();
+            }
+        });
+    }
+
+    fn breadcrumb(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let Some(source) = self.current_source.clone() else { return };
+        let Some(SourceTree { schemas: Loadable::Loaded(schemas), .. }) = self.trees.get(&source) else { return };
+        let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+        let schema = self.schema_choice.get(&source).cloned().or_else(|| names.first().cloned()).unwrap_or_default();
+        ui.add_space(6.0);
+        if names.len() > 1 {
+            ui.menu_button(RichText::new(format!("{schema} {}", icon::CARET_DOWN)).color(color::TEXT_WEAK), |ui| {
+                for name in names {
+                    if ui.selectable_label(name == schema, &name).clicked() {
+                        actions.push(Action::SelectSchema(source.clone(), name));
+                        ui.close();
+                    }
+                }
+            });
+        } else {
+            ui.label(RichText::new(&schema).color(color::TEXT_WEAK));
+        }
+        if let Some(tv) = self.active().filter(|c| c.source == source).and_then(|c| c.table.as_ref()) {
+            ui.label(RichText::new(icon::CARET_RIGHT).size(11.0).color(color::TEXT_FAINT));
+            ui.label(RichText::new(&tv.table).font(theme::font(13.0, theme::semibold())));
+        }
+    }
+
+    /// Auto-commit / manual transaction mode of the active console, with
+    /// Commit and Rollback while a transaction is open.
+    fn commit_menu(&mut self, ui: &mut egui::Ui, console_actions: &mut Vec<(u64, ConsoleAction)>) {
+        let Some(c) = self.tabs.get_mut(self.active_tab) else { return };
+        let (label, dot) = if c.in_transaction {
+            ("Transaction open", color::WARNING)
+        } else if c.tx_mode == TxMode::Manual {
+            ("Manual commit", color::WARNING)
+        } else {
+            ("Auto-commit", color::SUCCESS)
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "●  ",
+            0.0,
+            egui::TextFormat {
+                color: dot,
+                font_id: theme::font(9.0, egui::FontFamily::Proportional),
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+        job.append(
+            &format!("{label}  {}", icon::CARET_DOWN),
+            0.0,
+            egui::TextFormat { color: color::TEXT, valign: egui::Align::Center, ..Default::default() },
+        );
+        let can_end = c.in_transaction && c.run.is_none() && !c.tx_busy;
+        let id = c.id;
+        ui.menu_button(egui::WidgetText::from(job), |ui| {
+            if ui
+                .radio(c.tx_mode == TxMode::Auto, "Auto-commit")
+                .on_hover_text("Each statement commits on its own")
+                .clicked()
+            {
+                c.tx_mode = TxMode::Auto;
+            }
+            if ui
+                .radio(c.tx_mode == TxMode::Manual, "Manual commit")
+                .on_hover_text("Statements run in a transaction until you commit or roll back")
+                .clicked()
+            {
+                c.tx_mode = TxMode::Manual;
+            }
+            ui.separator();
+            if ui.add_enabled(can_end, egui::Button::new("Commit")).clicked() {
+                console_actions.push((id, ConsoleAction::Commit));
+                ui.close();
+            }
+            if ui.add_enabled(can_end, egui::Button::new("Rollback")).clicked() {
+                console_actions.push((id, ConsoleAction::Rollback));
+                ui.close();
+            }
+        });
+    }
+
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
         let (message, proceed) = match confirm {
@@ -1011,7 +1260,7 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(proceed).clicked() {
+                    if ui.add(theme::primary_button(proceed)).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1030,7 +1279,7 @@ impl App {
         }
         match confirm {
             Confirm::CloseConsole(id) => {
-                if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Console(c) if c.id == id)) {
+                if let Some(i) = self.tabs.iter().position(|c| c.id == id) {
                     self.close_tab(i);
                 }
             }
@@ -1043,32 +1292,24 @@ impl App {
     }
 }
 
-fn ddl_view(ui: &mut egui::Ui, text: &Loadable<String>) {
-    match text {
-        Loadable::Loaded(ddl) => {
-            if ui.button("Copy").clicked() {
-                ui.ctx().copy_text(ddl.clone());
+/// A segmented control: a sunken track with the selected option raised.
+fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {
+    egui::Frame::new().fill(color::BG_SUNKEN).corner_radius(8).inner_margin(3).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.horizontal(|ui| {
+            for (option, label) in options {
+                let selected = *value == *option;
+                let text = RichText::new(*label).font(theme::font(12.5, theme::medium()));
+                let button =
+                    egui::Button::new(if selected { text.color(color::TEXT) } else { text.color(color::TEXT_WEAK) })
+                        .fill(if selected { color::BG } else { Color32::TRANSPARENT })
+                        .stroke(if selected { Stroke::new(1.0, color::BORDER) } else { Stroke::NONE })
+                        .corner_radius(6)
+                        .min_size(egui::vec2(74.0, 22.0));
+                if ui.add(button).clicked() {
+                    *value = *option;
+                }
             }
-            ui.separator();
-            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                let job = crate::ui::sql_highlight::layout(ui, text.as_str(), wrap_width);
-                ui.fonts_mut(|f| f.layout_job(job))
-            };
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                let mut view = ddl.as_str();
-                ui.add(
-                    egui::TextEdit::multiline(&mut view)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .layouter(&mut layouter),
-                );
-            });
-        }
-        Loadable::Failed(e) => {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-        }
-        _ => {
-            ui.spinner();
-        }
-    }
+        });
+    });
 }
