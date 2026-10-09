@@ -56,6 +56,73 @@ fn same_value(original: &Value, edited: &Value) -> bool {
     }
 }
 
+/// "Set to now" for a date / time column: the menu label and the current local
+/// time as text the column's engine reads (Oracle via the session NLS formats).
+pub fn now_value(type_name: &str, dialect: Dialect) -> Option<(&'static str, Value)> {
+    let t = type_name.to_lowercase();
+    let now = chrono::Local::now();
+    let text = if t.contains("time zone") || t.contains("timestamptz") {
+        now.format("%Y-%m-%d %H:%M:%S%.6f %:z").to_string()
+    } else if t.contains("timestamp") || t.contains("datetime") {
+        match dialect {
+            Dialect::Sqlite => now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            _ => now.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        }
+    } else if t.starts_with("date") {
+        // Oracle DATE carries a time of day.
+        return Some(match dialect {
+            Dialect::Oracle => ("Set to now", Value::Text(now.format("%Y-%m-%d %H:%M:%S").to_string())),
+            _ => ("Set to today", Value::Text(now.format("%Y-%m-%d").to_string())),
+        });
+    } else if t.starts_with("time") {
+        now.format("%H:%M:%S").to_string()
+    } else {
+        return None;
+    };
+    Some(("Set to now", Value::Text(text)))
+}
+
+/// A copy of fetched row `row` (with its pending edits) as a new row. Key
+/// columns the database fills in itself (a default, or SQLite's rowid alias)
+/// are left to their default so the copy doesn't collide.
+pub fn duplicate(
+    rs: &ResultSet,
+    edits: &Edits,
+    row: usize,
+    target: &EditTarget,
+    details: Option<&TableDetails>,
+    dialect: Dialect,
+) -> Vec<Option<Value>> {
+    let rowid_alias = dialect == Dialect::Sqlite
+        && target.key.len() == 1
+        && target.columns[target.key[0]].sql_type.eq_ignore_ascii_case("integer");
+    (0..rs.columns.len())
+        .map(|c| {
+            if target.key.contains(&c) {
+                let has_default = details
+                    .and_then(|d| d.columns.iter().find(|col| col.name == target.columns[c].name))
+                    .is_some_and(|col| col.default.is_some());
+                if has_default || rowid_alias {
+                    return None;
+                }
+                // A single integer key without a default gets the next number after
+                // the fetched and pending rows, so the copy doesn't collide on it.
+                if target.key.len() == 1
+                    && let Value::Int(_) = rs.rows[row][c]
+                {
+                    let fetched = rs.rows.iter().filter_map(|r| if let Value::Int(i) = r[c] { Some(i) } else { None });
+                    let pending = edits.inserts.iter().filter_map(|r| match &r[c] {
+                        Some(Value::Int(i)) => Some(*i),
+                        _ => None,
+                    });
+                    return Some(Value::Int(fetched.chain(pending).max().unwrap_or(0) + 1));
+                }
+            }
+            Some(edits.updates.get(&(row, c)).cloned().unwrap_or_else(|| rs.rows[row][c].clone()))
+        })
+        .collect()
+}
+
 /// The single table a result set can be written back to.
 pub struct EditTarget {
     pub schema: String,

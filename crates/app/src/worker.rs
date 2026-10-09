@@ -288,19 +288,25 @@ async fn apply_edits(
         conn.execute("BEGIN", &[], None).await.map_err(|e| format!("BEGIN failed: {}", e.message))?;
     }
     for (sql, params, expect_one) in statements {
+        // The reason first, then the statement: the first line is what the banner shows.
         let failure = match conn.execute(&sql, &params, None).await {
-            Ok(dbm_core::ExecOutcome::Affected(n)) if expect_one && n != 1 => Some(format!(
-                "{sql}\naffected {n} rows instead of 1; the row may have been changed or deleted meanwhile"
-            )),
+            Ok(dbm_core::ExecOutcome::Affected(n)) if expect_one && n != 1 => {
+                Some(format!("affected {n} rows instead of 1; the row may have been changed or deleted meanwhile"))
+            }
             Ok(_) => None,
-            Err(e) => Some(format!("{sql}\n{}", e.message)),
+            Err(e) => Some(match e.detail {
+                Some(detail) => format!("{} ({detail})", e.message),
+                None => e.message,
+            }),
         };
-        if let Some(message) = failure {
+        if let Some(reason) = failure {
             if own_transaction {
                 let _ = conn.execute("ROLLBACK", &[], None).await;
-                return Err(format!("Nothing was saved. {message}"));
+                return Err(format!("Nothing was saved: {reason}\n\n{sql}"));
             }
-            return Err(format!("{message}\nThe console's transaction is still open; roll back or fix and retry."));
+            return Err(format!(
+                "{reason}\nThe console's transaction is still open; roll back or fix and retry.\n\n{sql}"
+            ));
         }
     }
     if own_transaction {
