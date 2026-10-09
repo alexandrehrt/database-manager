@@ -25,6 +25,8 @@ const RUN_STATEMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND
 const RUN_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Enter);
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
+pub const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
+pub const OPEN_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 
 /// SQL plus its bound parameters.
 pub type Statement = (String, Vec<Value>);
@@ -215,6 +217,11 @@ pub struct Console {
     pub wanted_details: Vec<(String, String)>,
     /// The SQL view needs the table's DDL; the app loads it.
     pub wanted_ddl: bool,
+    /// The `.sql` file this console is bound to, and its text when last loaded or saved.
+    pub file: Option<std::path::PathBuf>,
+    pub saved_text: Option<String>,
+    /// Cmd+S this frame: saves grid edits if there are any, else the file.
+    save_requested: bool,
     editor_collapsed: bool,
     panel_open: bool,
     panel: Option<RowPanel>,
@@ -235,6 +242,8 @@ pub enum ConsoleAction {
     Cancel,
     Commit,
     Rollback,
+    /// Ask the app to open a `.sql` file in a new console.
+    OpenFile,
     /// Apply the pending edits of result tab `tab`.
     SubmitEdits {
         tab: usize,
@@ -273,12 +282,48 @@ impl Console {
             completion_waiting: false,
             wanted_details: Vec::new(),
             wanted_ddl: false,
+            file: None,
+            saved_text: None,
+            save_requested: false,
             editor_collapsed: false,
             panel_open: true,
             panel: None,
             view_sql: None,
             guard: None,
             statement_rect: None,
+        }
+    }
+
+    /// The editor has changes not yet written to its `.sql` file.
+    pub fn file_dirty(&self) -> bool {
+        self.file.is_some() && self.saved_text.as_deref() != Some(self.sql.as_str())
+    }
+
+    /// Writes the editor to its file, asking for a path when there is none
+    /// (or for Save As). The outcome shows in the status bar.
+    fn save_file(&mut self, ask_path: bool) {
+        let path = match (&self.file, ask_path) {
+            (Some(p), false) => p.clone(),
+            _ => {
+                let name = format!("{}.sql", self.title.trim_end_matches(".sql"));
+                let mut dialog = rfd::FileDialog::new().add_filter("SQL", &["sql"]).set_file_name(&name);
+                if let Some(dir) = self.file.as_ref().and_then(|p| p.parent()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                match dialog.save_file() {
+                    Some(p) => p,
+                    None => return,
+                }
+            }
+        };
+        match std::fs::write(&path, &self.sql) {
+            Ok(()) => {
+                self.title = path.file_name().map_or_else(|| self.title.clone(), |n| n.to_string_lossy().into_owned());
+                self.tx_notice = Some(Ok(format!("Saved {}", path.display())));
+                self.saved_text = Some(self.sql.clone());
+                self.file = Some(path);
+            }
+            Err(e) => self.tx_notice = Some(Err(format!("Could not save {}: {e}", path.display()))),
         }
     }
 
@@ -289,7 +334,17 @@ impl Console {
 
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
         let before = (self.sql.clone(), self.table.as_ref().map(|t| (t.filters.clone(), t.order.clone(), t.sort)));
+        // Save As first: Cmd+S also matches Shift+Cmd+S logically.
+        let (save_as, save) = ui.input_mut(|i| (i.consume_shortcut(&SAVE_AS), i.consume_shortcut(&SAVE)));
+        self.save_requested = save;
         let action = self.show_inner(ui, cx);
+        // Cmd+S not taken by pending grid edits saves the file.
+        if std::mem::take(&mut self.save_requested) {
+            self.save_file(false);
+        }
+        if save_as {
+            self.save_file(true);
+        }
         let action = self.guarded(action, before);
         self.guard_modal(ui).or(action)
     }
@@ -394,6 +449,27 @@ impl Console {
                     {
                         self.editor_collapsed = !self.editor_collapsed;
                     }
+                    ui.menu_button(format!("{}  File", icon::FILE_TEXT), |ui| {
+                        let ctx = ui.ctx().clone();
+                        if ui.add(egui::Button::new("Open…").shortcut_text(ctx.format_shortcut(&OPEN_FILE))).clicked()
+                        {
+                            action = Some(ConsoleAction::OpenFile);
+                            ui.close();
+                        }
+                        if ui.add(egui::Button::new("Save").shortcut_text(ctx.format_shortcut(&SAVE))).clicked() {
+                            self.save_file(false);
+                            ui.close();
+                        }
+                        if ui.add(egui::Button::new("Save As…").shortcut_text(ctx.format_shortcut(&SAVE_AS))).clicked()
+                        {
+                            self.save_file(true);
+                            ui.close();
+                        }
+                        if let Some(path) = &self.file {
+                            ui.separator();
+                            ui.label(RichText::new(path.display().to_string()).small().color(color::TEXT_WEAK));
+                        }
+                    });
                     ui.menu_button(format!("{}  History", icon::CLOCK_COUNTER_CLOCKWISE), |ui| {
                         if cx.history.is_empty() {
                             ui.weak("No queries yet");
@@ -1145,7 +1221,7 @@ impl Console {
     ) -> Option<ConsoleAction> {
         let mut action = None;
         let dialect = self.dialect;
-        let save = ui.input_mut(|i| i.consume_shortcut(&SAVE));
+        let save = self.save_requested;
         egui::Panel::bottom(egui::Id::new(("status", self.id))).frame(Self::status_frame()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(a) = self.run_status(ui) {
@@ -1198,6 +1274,9 @@ impl Console {
                     let Ok(ExecOutcome::Rows(rs)) = &self.results[idx].outcome else { return };
                     let statements = || edits::statements(dialect, t, rs, &self.results[idx].edits);
                     let save_button = theme::primary_button(format!("Save   {}", ctx.format_shortcut(&SAVE)));
+                    if save && pending > 0 {
+                        self.save_requested = false;
+                    }
                     if (ui.add_enabled(idle, save_button).clicked() || (save && idle)) && pending > 0 {
                         action = Some(ConsoleAction::SubmitEdits { tab: idx, statements: statements() });
                     }

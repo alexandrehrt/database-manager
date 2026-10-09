@@ -79,3 +79,57 @@ pub fn save_history(history: &HashMap<String, Vec<String>>) -> anyhow::Result<()
     }
     std::fs::write(&path, serde_json::to_string(history)?).with_context(|| format!("writing {}", path.display()))
 }
+
+/// Open tabs, restored at startup (without re-running anything).
+#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    pub tabs: Vec<SessionTab>,
+    pub active: usize,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTab {
+    pub source: String,
+    pub title: String,
+    pub sql: String,
+    /// The `.sql` file the console is bound to, and its text when last loaded or saved.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    #[serde(default)]
+    pub saved_text: Option<String>,
+    #[serde(default)]
+    pub table: Option<SessionTable>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTable {
+    pub schema: String,
+    pub table: String,
+    pub filters: Vec<String>,
+    pub order: String,
+    /// "content", "structure" or "sql".
+    pub mode: String,
+}
+
+fn session_path() -> anyhow::Result<PathBuf> {
+    Ok(config_path()?.with_file_name("session.json"))
+}
+
+pub fn load_session() -> Session {
+    session_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_session(session: &Session) -> anyhow::Result<()> {
+    let path = session_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Write then rename, so a crash mid-write can't leave a truncated session.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(session)?)?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
