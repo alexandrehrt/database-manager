@@ -155,6 +155,22 @@ impl TableView {
     }
 }
 
+/// Editor text and table filters / order / sort, captured before a frame's
+/// action so a cancelled discard can restore them.
+type Snapshot = (String, Option<(Vec<String>, String, Option<(usize, bool)>)>);
+
+/// An action that would throw away unsaved grid edits, held until the user
+/// confirms. Cancelling restores what the frame changed on the way.
+struct Guard {
+    action: Option<ConsoleAction>,
+    /// Result tab to close once confirmed.
+    close_result: Option<usize>,
+    /// Result tabs whose edits are discarded.
+    tabs: Vec<usize>,
+    /// Restored on cancel.
+    restore: Snapshot,
+}
+
 /// The open completion list.
 pub struct CompletionPopup {
     items: Vec<Item>,
@@ -204,8 +220,8 @@ pub struct Console {
     panel: Option<RowPanel>,
     /// The statements "View SQL" shows.
     view_sql: Option<String>,
-    /// Result tab whose refresh waits for the user to discard pending edits.
-    confirm_refresh: Option<usize>,
+    /// An action waiting for the user to discard pending grid edits.
+    guard: Option<Guard>,
     /// Rows of the statement under the cursor last frame, for its highlight.
     statement_rect: Option<egui::Rect>,
 }
@@ -261,7 +277,7 @@ impl Console {
             panel_open: true,
             panel: None,
             view_sql: None,
-            confirm_refresh: None,
+            guard: None,
             statement_rect: None,
         }
     }
@@ -272,6 +288,13 @@ impl Console {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
+        let before = (self.sql.clone(), self.table.as_ref().map(|t| (t.filters.clone(), t.order.clone(), t.sort)));
+        let action = self.show_inner(ui, cx);
+        let action = self.guarded(action, before);
+        self.guard_modal(ui).or(action)
+    }
+
+    fn show_inner(&mut self, ui: &mut egui::Ui, cx: &ConsoleContext<'_>) -> Option<ConsoleAction> {
         match self.table.as_ref().map(|t| t.mode) {
             Some(ViewMode::Structure) => {
                 self.structure_view(ui, cx);
@@ -300,9 +323,6 @@ impl Console {
             action = Some(a);
         }
         self.view_sql_modal(ui);
-        if let Some(a) = self.refresh_confirm_modal(ui) {
-            action = Some(a);
-        }
         action
     }
 
@@ -835,12 +855,21 @@ impl Console {
         });
         if refresh
             && !running
-            && let Some(a) = self.request_refresh(idx)
+            && let Some(a) = self.refresh(idx)
         {
             action = Some(a);
         }
         if let Some(i) = close_result {
-            self.close_result(i);
+            if self.results.get(i).is_some_and(|t| t.edits.row_count() > 0) {
+                self.guard = Some(Guard {
+                    action: None,
+                    close_result: Some(i),
+                    tabs: vec![i],
+                    restore: (self.sql.clone(), None),
+                });
+            } else {
+                self.close_result(i);
+            }
         }
         action
     }
@@ -1213,31 +1242,49 @@ impl Console {
         })
     }
 
-    /// Refreshes, first asking if the tab has pending grid edits.
-    fn request_refresh(&mut self, idx: usize) -> Option<ConsoleAction> {
-        if self.results.get(idx).is_some_and(|t| t.edits.row_count() > 0) {
-            self.confirm_refresh = Some(idx);
-            return None;
+    /// Result tabs whose pending edits `action` would throw away.
+    fn discarded_by(&self, action: &ConsoleAction) -> Vec<usize> {
+        let with_edits = |i: usize| self.results.get(i).is_some_and(|t| t.edits.row_count() > 0);
+        match action {
+            ConsoleAction::Run { mode: RunMode::Fresh, .. } => {
+                (0..self.results.len()).filter(|&i| with_edits(i)).collect()
+            }
+            ConsoleAction::Run { mode: RunMode::Replace(i), .. } => {
+                [*i].into_iter().filter(|&i| with_edits(i)).collect()
+            }
+            ConsoleAction::Run { mode: RunMode::Filter, .. } => [0].into_iter().filter(|&i| with_edits(i)).collect(),
+            _ => Vec::new(),
         }
-        self.refresh(idx)
     }
 
-    fn refresh_confirm_modal(&mut self, ui: &egui::Ui) -> Option<ConsoleAction> {
-        let idx = self.confirm_refresh?;
-        let pending = self.results.get(idx).map_or(0, |t| t.edits.row_count());
+    /// Holds `action` behind a confirmation when it would discard pending edits.
+    fn guarded(&mut self, action: Option<ConsoleAction>, before: Snapshot) -> Option<ConsoleAction> {
+        let a = action?;
+        let tabs = self.discarded_by(&a);
+        if tabs.is_empty() {
+            return Some(a);
+        }
+        self.guard = Some(Guard { action: Some(a), close_result: None, tabs, restore: before });
+        None
+    }
+
+    fn guard_modal(&mut self, ui: &egui::Ui) -> Option<ConsoleAction> {
+        let guard = self.guard.as_ref()?;
+        let pending: usize = guard.tabs.iter().filter_map(|&i| self.results.get(i)).map(|t| t.edits.row_count()).sum();
+        let what = if guard.close_result.is_some() { "Closing this result" } else { "This" };
         let mut decision = None;
-        let modal = egui::Modal::new(egui::Id::new(("confirm-refresh", self.id))).show(ui.ctx(), |ui| {
-            ui.set_width(380.0);
+        let modal = egui::Modal::new(egui::Id::new(("discard-guard", self.id))).show(ui.ctx(), |ui| {
+            ui.set_width(390.0);
             ui.heading("Discard pending changes?");
             ui.add_space(6.0);
             ui.label(format!(
-                "Refreshing reloads the rows and discards {pending} unsaved change{}.",
+                "{what} throws away {pending} unsaved change{}. Save them first with Save (Cmd+S) to keep them.",
                 if pending == 1 { "" } else { "s" }
             ));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::primary_button("Discard and refresh")).clicked() {
+                    if ui.add(theme::primary_button("Discard changes")).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1250,17 +1297,29 @@ impl Console {
             decision = Some(false);
         }
         let proceed = decision?;
-        self.confirm_refresh = None;
-        if !proceed || self.run.is_some() {
+        let guard = self.guard.take()?;
+        if !proceed {
+            let (sql, table) = guard.restore;
+            self.sql = sql;
+            if let (Some(tv), Some((filters, order, sort))) = (&mut self.table, table) {
+                tv.filters = filters;
+                tv.order = order;
+                tv.sort = sort;
+            }
             return None;
         }
-        if let Some(tab) = self.results.get_mut(idx) {
-            tab.edits = Edits::default();
-            tab.editing = None;
-            tab.edit_error = None;
+        for i in guard.tabs {
+            if let Some(tab) = self.results.get_mut(i) {
+                tab.edits = Edits::default();
+                tab.editing = None;
+                tab.edit_error = None;
+            }
         }
         self.panel = None;
-        self.refresh(idx)
+        if let Some(i) = guard.close_result {
+            self.close_result(i);
+        }
+        guard.action.filter(|_| self.run.is_none())
     }
 
     fn view_sql_modal(&mut self, ui: &egui::Ui) {

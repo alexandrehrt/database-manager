@@ -330,7 +330,7 @@ impl App {
     /// Closes tab `i`, first asking if its console has an open transaction.
     fn request_close_tab(&mut self, i: usize) {
         match self.tabs.get(i) {
-            Some(c) if c.in_transaction => self.confirm = Some(Confirm::CloseConsole(c.id)),
+            Some(c) if c.in_transaction || c.has_pending_edits() => self.confirm = Some(Confirm::CloseConsole(c.id)),
             Some(_) => self.close_tab(i),
             None => {}
         }
@@ -805,7 +805,7 @@ impl eframe::App for App {
         let mut close_active = false;
         if ui.ctx().input(|i| i.viewport().close_requested())
             && !self.quit_confirmed
-            && self.tabs.iter().any(|c| c.in_transaction)
+            && self.tabs.iter().any(|c| c.in_transaction || c.has_pending_edits())
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Quit);
@@ -1252,20 +1252,31 @@ impl App {
 
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
-        let (message, proceed) = match confirm {
-            Confirm::CloseConsole(_) => {
-                ("This console has an open transaction. Closing it rolls the transaction back.", "Roll back and close")
+        // What would be lost: unsaved grid edits and/or open transactions.
+        let losses = |consoles: Vec<&Console>| {
+            let edits = consoles.iter().any(|c| c.has_pending_edits());
+            let tx = consoles.iter().any(|c| c.in_transaction);
+            match (edits, tx) {
+                (true, true) => "unsaved grid edits are discarded and the open transaction is rolled back",
+                (true, false) => "unsaved grid edits are discarded",
+                _ => "the open transaction is rolled back",
             }
+        };
+        let (message, proceed) = match confirm {
+            Confirm::CloseConsole(id) => (
+                format!("If you close this tab, {}.", losses(self.tabs.iter().filter(|c| c.id == *id).collect())),
+                "Close anyway",
+            ),
             Confirm::Disconnect(_) => (
-                "A console on this data source has an open transaction. Disconnecting rolls it back.",
+                "A console on this data source has an open transaction. Disconnecting rolls it back.".to_string(),
                 "Roll back and disconnect",
             ),
-            Confirm::Quit => ("A console has an open transaction. Quitting rolls it back.", "Roll back and quit"),
+            Confirm::Quit => (format!("If you quit, {}.", losses(self.tabs.iter().collect())), "Quit anyway"),
         };
         let mut decision = None;
         let modal = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Uncommitted changes");
+            ui.heading("Unsaved work");
             ui.add_space(6.0);
             ui.label(message);
             ui.add_space(10.0);
