@@ -55,7 +55,7 @@ fn init_client(dir: Option<&Path>) -> DbResult<()> {
     });
     match result {
         Ok(_) => Ok(()),
-        Err(e) => Err(DbError { message: INSTANT_CLIENT_HELP.into(), detail: Some(e.clone()), code: None }),
+        Err(e) => Err(DbError { detail: Some(e.clone()), ..DbError::new(INSTANT_CLIENT_HELP) }),
     }
 }
 
@@ -68,7 +68,10 @@ fn ora_err(e: oracle::Error) -> DbError {
                 Some((first, rest)) => (first.to_string(), Some(rest.trim().to_string())),
                 None => (text.to_string(), None),
             };
-            DbError { message, detail, code: Some(format!("ORA-{:05}", db.code())) }
+            // The parse offset is in bytes; statements are nearly always ASCII, so it
+            // stands for the character offset. 0 also means "no position".
+            let position = (db.offset() > 0).then_some(db.offset() as usize);
+            DbError { message, detail, code: Some(format!("ORA-{:05}", db.code())), position }
         }
         None => DbError::new(e.to_string()),
     }

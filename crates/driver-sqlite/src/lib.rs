@@ -38,11 +38,21 @@ fn db_err(e: rusqlite::Error) -> DbError {
     let code = e.sqlite_error_code();
     let message = if code == Some(rusqlite::ErrorCode::OperationInterrupted) {
         "Query cancelled".to_string()
+    } else if let rusqlite::Error::SqlInputError { msg, .. } = &e {
+        // Its Display repeats the whole statement; the message alone is enough.
+        msg.clone()
     } else {
         e.to_string()
     };
     let code = code.filter(|c| *c != rusqlite::ErrorCode::Unknown).map(|c| format!("{c:?}"));
-    DbError { message, detail: None, code }
+    // SQLite reports a byte offset into the statement (-1 when it has none).
+    let position = match &e {
+        rusqlite::Error::SqlInputError { sql, offset, .. } if *offset >= 0 => {
+            sql.get(..*offset as usize).map(|s| s.chars().count())
+        }
+        _ => None,
+    };
+    DbError { message, detail: None, code, position }
 }
 
 impl SqliteConnection {

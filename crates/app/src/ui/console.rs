@@ -17,7 +17,7 @@ use crate::ui::completion::{self, Catalog, Item};
 use crate::ui::edits::{self, EditStatement, EditTarget, Edits, RowRef};
 use crate::ui::grid::{self, ColumnMeta, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
 use crate::ui::theme::{self, color, icon};
-use crate::ui::{sql_format, sql_highlight};
+use crate::ui::{editor_ops, sql_format, sql_highlight};
 
 pub const PAGE_SIZE: usize = 500;
 
@@ -27,6 +27,9 @@ const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S)
 const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 pub const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
 pub const OPEN_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
+const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
+const MOVE_UP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp);
+const MOVE_DOWN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowDown);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const COMMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash);
 const FORMAT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::L);
@@ -243,7 +246,15 @@ pub struct Console {
     save_requested: bool,
     find: Option<FindBar>,
     /// A run held for confirmation: UPDATE / DELETE statements without WHERE.
-    unrestricted: Option<(ConsoleAction, Vec<String>)>,
+    unrestricted: Option<(ConsoleAction, Vec<(String, &'static str)>)>,
+    /// Put the editor cursor at this byte offset next frame (an error position).
+    jump_to: Option<usize>,
+    /// Scroll the editor to this byte offset once it is drawn.
+    reveal_byte: Option<usize>,
+    /// Closing halves auto-inserted while typing, innermost last, as (closer,
+    /// distance from the end of the text). Typing inside the pair doesn't move
+    /// that distance, so it locates the closer without tracking every edit.
+    auto_closers: Vec<(char, usize)>,
     editor_collapsed: bool,
     panel_open: bool,
     panel: Option<RowPanel>,
@@ -284,6 +295,8 @@ pub struct ConsoleContext<'a> {
     pub tables: &'a HashMap<(String, String), TableDetails>,
     pub incoming: &'a HashMap<(String, String), Vec<IncomingKey>>,
     pub catalog: &'a Catalog<'a>,
+    /// The data source is read-only: writing statements and grid edits are blocked.
+    pub read_only: bool,
 }
 
 impl Console {
@@ -313,6 +326,9 @@ impl Console {
             save_requested: false,
             find: None,
             unrestricted: None,
+            jump_to: None,
+            reveal_byte: None,
+            auto_closers: Vec::new(),
             editor_collapsed: false,
             panel_open: true,
             panel: None,
@@ -357,6 +373,29 @@ impl Console {
         }
     }
 
+    /// Where result `idx`'s error is in the editor: (byte offset, line, column),
+    /// 1-based line and column. None without a position or if the statement
+    /// isn't in the editor text any more.
+    fn error_location(&self, idx: usize) -> Option<(usize, usize, usize)> {
+        let tab = self.results.get(idx)?;
+        let pos = tab.outcome.as_ref().err()?.position?;
+        let start = self.sql.find(tab.sql.as_str())?;
+        let offset = tab.sql.char_indices().nth(pos).map_or(tab.sql.len(), |(b, _)| b);
+        let at = start + offset;
+        let before = &self.sql[..at];
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        Some((at, line, column))
+    }
+
+    /// Moves the editor cursor to result `idx`'s error, if it has a position.
+    pub fn reveal_error(&mut self, idx: usize) {
+        if let Some((at, _, _)) = self.error_location(idx) {
+            self.jump_to = Some(at);
+            self.editor_collapsed = false;
+        }
+    }
+
     /// Whether any result tab has unsaved grid edits.
     pub fn has_pending_edits(&self) -> bool {
         self.results.iter().any(|t| t.edits.row_count() > 0)
@@ -368,6 +407,7 @@ impl Console {
         let (save_as, save) = ui.input_mut(|i| (i.consume_shortcut(&SAVE_AS), i.consume_shortcut(&SAVE)));
         self.save_requested = save;
         let action = self.show_inner(ui, cx);
+        let action = self.block_writes(action, cx.read_only);
         let action = self.hold_unrestricted(action).or_else(|| self.unrestricted_modal(ui));
         // Cmd+S not taken by pending grid edits saves the file.
         if std::mem::take(&mut self.save_requested) {
@@ -449,6 +489,9 @@ impl Console {
             self.open_find(ui, editor_id);
         }
         if editor_focused {
+            self.editor_keys(ui, editor_id);
+        }
+        if editor_focused {
             let (comment, format) = ui.input_mut(|i| (i.consume_shortcut(&COMMENT), i.consume_shortcut(&FORMAT)));
             if comment {
                 self.toggle_comment(ui, editor_id);
@@ -463,6 +506,10 @@ impl Console {
             f.current = f.current.min(matches.len().saturating_sub(1));
         }
         let current_match = self.find.as_ref().filter(|_| !matches.is_empty()).map(|f| f.current);
+        if let Some(at) = self.jump_to.take().filter(|&at| at <= self.sql.len() && self.sql.is_char_boundary(at)) {
+            self.select_in_editor(ui.ctx(), editor_id, at..at);
+            self.reveal_byte = Some(at);
+        }
         let mut editor_out = None;
         let mut marker_run = None;
 
@@ -616,6 +663,12 @@ impl Console {
                                 state.cursor.set_char_range(Some(range));
                                 state.store(ui.ctx(), editor_id);
                             }
+                        }
+                        if let Some(at) = self.reveal_byte.take().filter(|&at| at <= self.sql.len()) {
+                            let c = self.sql[..at].chars().count();
+                            let rect = output.galley.pos_from_cursor(egui::text::CCursor::new(c));
+                            // Minimal scrolling: just enough to bring it into view.
+                            ui.scroll_to_rect(rect.translate(output.galley_pos.to_vec2()), None);
                         }
                         marker_run = self.paint_gutter(ui, gutter, &output.galley, output.galley_pos, cursor);
                         editor_out = Some((
@@ -982,6 +1035,131 @@ impl Console {
         }
     }
 
+    /// Line commands and typing helpers, applied before the text field sees the
+    /// keys: Cmd+D, Alt+Up / Down, Enter with indentation, paired brackets and
+    /// quotes, and Backspace inside an empty pair.
+    fn editor_keys(&mut self, ui: &egui::Ui, editor_id: egui::Id) {
+        let Some((mut start, mut end)) = self.editor_selection(ui.ctx(), editor_id) else { return };
+        let mut text = self.sql.clone();
+        let mut changed = false;
+        let (dup, up, down) = ui.input_mut(|i| {
+            (i.consume_shortcut(&DUPLICATE), i.consume_shortcut(&MOVE_UP), i.consume_shortcut(&MOVE_DOWN))
+        });
+        let line_edit = if dup {
+            Some(editor_ops::duplicate_lines(&text, start, end))
+        } else if up || down {
+            editor_ops::move_lines(&text, start, end, up)
+        } else {
+            None
+        };
+        if let Some((t, a, b)) = line_edit {
+            (text, start, end, changed) = (t, a, b, true);
+        }
+        ui.input_mut(|i| {
+            let mut keep = Vec::with_capacity(i.events.len());
+            // Once the text field must handle an edit, it handles the rest of the
+            // frame's edits too, so they apply in the order they were typed.
+            let mut intercept = true;
+            for event in std::mem::take(&mut i.events) {
+                if intercept {
+                    // Drop closers the cursor has left (or that were edited away).
+                    let closers = &mut self.auto_closers;
+                    while let Some(&(ch, from_end)) = closers.last() {
+                        let at = text.len().checked_sub(from_end);
+                        let inside = at
+                            .is_some_and(|at| at >= end && text[at..].starts_with(ch) && !text[end..at].contains('\n'));
+                        if inside {
+                            break;
+                        }
+                        closers.pop();
+                    }
+                    let result = match &event {
+                        // On macOS typed text can also arrive as an IME commit.
+                        egui::Event::Text(t) | egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                            let mut chars = t.chars();
+                            match (chars.next(), chars.next()) {
+                                (Some(c), None) => {
+                                    let r = editor_ops::type_char(&text, start, end, c);
+                                    // A new pair (not a wrapped selection): remember its closer.
+                                    if let Some((t, _, b)) = &r
+                                        && start == end
+                                        && t.len() == text.len() + 2 * c.len_utf8()
+                                    {
+                                        let closer = t[*b..].chars().next().unwrap_or(c);
+                                        closers.push((closer, t.len() - *b));
+                                    }
+                                    r
+                                }
+                                _ => None,
+                            }
+                        }
+                        // Tab right after typing inside an auto-closed pair: step out of it.
+                        egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. }
+                            if modifiers.is_none() && start == end =>
+                        {
+                            closers.pop().map(|(ch, from_end)| {
+                                let at = text.len() - from_end + ch.len_utf8();
+                                (text.clone(), at, at)
+                            })
+                        }
+                        egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                            Some(editor_ops::newline(&text, start, end))
+                        }
+                        egui::Event::Key { key: Key::Backspace, pressed: true, modifiers, .. }
+                            if modifiers.is_none() =>
+                        {
+                            editor_ops::backspace(&text, start, end)
+                        }
+                        _ => None,
+                    };
+                    match result {
+                        Some((t, a, b)) => {
+                            (text, start, end, changed) = (t, a, b, true);
+                            continue;
+                        }
+                        None => {
+                            // Only events that change the text or move the cursor end
+                            // interception. A typed character also brings a key press
+                            // (and on macOS IME preedit events) before its text; those
+                            // must not stop us from seeing the text.
+                            let edits_or_moves = match &event {
+                                egui::Event::Text(_)
+                                | egui::Event::Paste(_)
+                                | egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+                                egui::Event::Key { key, pressed: true, .. } => matches!(
+                                    key,
+                                    Key::Enter
+                                        | Key::Backspace
+                                        | Key::Delete
+                                        | Key::Tab
+                                        | Key::ArrowLeft
+                                        | Key::ArrowRight
+                                        | Key::ArrowUp
+                                        | Key::ArrowDown
+                                        | Key::Home
+                                        | Key::End
+                                        | Key::PageUp
+                                        | Key::PageDown
+                                ),
+                                _ => false,
+                            };
+                            if edits_or_moves {
+                                intercept = false;
+                            }
+                        }
+                    }
+                }
+                keep.push(event);
+            }
+            i.events = keep;
+        });
+        if changed {
+            self.sql = text;
+            self.select_in_editor(ui.ctx(), editor_id, start..end);
+            self.reveal_byte = Some(end);
+        }
+    }
+
     /// Cmd+/: toggles `--` on the selected lines, or the cursor's line.
     fn toggle_comment(&mut self, ui: &egui::Ui, editor_id: egui::Id) {
         let (a, b) = self.editor_selection(ui.ctx(), editor_id).unwrap_or((self.sql.len(), self.sql.len()));
@@ -1119,6 +1297,7 @@ impl Console {
         let idx = self.active_result.min(self.results.len() - 1);
         let running = self.run.is_some();
         let target = match &self.results[idx].outcome {
+            Ok(ExecOutcome::Rows(_)) if cx.read_only => Some(Err("Read-only connection".to_string())),
             Ok(ExecOutcome::Rows(rs)) => Some(edits::edit_target(rs, cx.tables)),
             _ => None,
         };
@@ -1209,15 +1388,15 @@ impl Console {
                                     .on_disabled_hover_text("Select rows first");
                                 if dup.clicked() {
                                     let details = cx.tables.get(&(t.schema.clone(), t.table.clone()));
-                                    let mut order: Vec<usize> =
-                                        tab.sort.order().iter().copied().filter(|r| selected.contains(r)).collect();
-                                    if order.is_empty() {
-                                        order = selected.clone();
-                                    }
-                                    for r in order {
-                                        let copy = edits::duplicate(rs, &tab.edits, r, t, details, self.dialect);
-                                        tab.edits.inserts.push(copy);
-                                    }
+                                    duplicate_selected(
+                                        rs,
+                                        &mut tab.edits,
+                                        &tab.selection,
+                                        &tab.sort,
+                                        t,
+                                        details,
+                                        self.dialect,
+                                    );
                                 }
                             }
                             if let Some(Err(reason)) = &target {
@@ -1414,6 +1593,13 @@ impl Console {
         let console_id = self.id;
         let dialect = self.dialect;
         let server_sort = self.table.as_ref().filter(|_| idx == 0).map(|tv| tv.sort);
+        let location = if self.table.is_none() { self.error_location(idx) } else { None };
+        if let Some(Ok(t)) = target
+            && !running
+        {
+            self.grid_keys(ui, cx, idx, t);
+        }
+        let mut go_to_error = false;
         let tab = &mut self.results[idx];
         let rs = match &tab.outcome {
             Ok(ExecOutcome::Rows(rs)) => rs,
@@ -1443,10 +1629,25 @@ impl Console {
                         if let Some(code) = &e.code {
                             ui.label(RichText::new(format!("code {code}")).small().color(color::TEXT_WEAK));
                         }
+                        if let Some((_, line, column)) = location {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Line {line}, column {column}"))
+                                        .small()
+                                        .color(color::TEXT_WEAK),
+                                );
+                                if ui.link(RichText::new("Show in editor").small().color(color::LINK)).clicked() {
+                                    go_to_error = true;
+                                }
+                            });
+                        }
                         ui.add_space(8.0);
                         ui.label(RichText::new(&tab.sql).font(theme::mono(12.0)).color(color::TEXT_WEAK));
                     });
                 });
+                if go_to_error {
+                    self.reveal_error(idx);
+                }
                 return None;
             }
         };
@@ -1528,6 +1729,42 @@ impl Console {
             action = self.filter_run();
         }
         action
+    }
+
+    /// Grid keys while no text field has focus: Delete / Backspace mark the
+    /// selected rows for deletion, Cmd+D duplicates them, Enter / F2 edit the
+    /// selected cell.
+    fn grid_keys(&mut self, ui: &egui::Ui, cx: &ConsoleContext<'_>, idx: usize, t: &EditTarget) {
+        if ui.ctx().memory(|m| m.focused().is_some()) || self.guard.is_some() || self.unrestricted.is_some() {
+            return;
+        }
+        let tab = &mut self.results[idx];
+        if tab.editing.is_some() || tab.submitting || tab.selection.rows.is_empty() {
+            return;
+        }
+        let Ok(ExecOutcome::Rows(rs)) = &tab.outcome else { return };
+        let (delete, duplicate, edit) = ui.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace),
+                i.consume_shortcut(&DUPLICATE),
+                i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::F2),
+            )
+        });
+        if delete {
+            tab.edits.deletes.extend(tab.selection.rows.iter().copied());
+        }
+        if duplicate {
+            let details = cx.tables.get(&(t.schema.clone(), t.table.clone()));
+            duplicate_selected(rs, &mut tab.edits, &tab.selection, &tab.sort, t, details, self.dialect);
+        }
+        if edit && let Some(row) = tab.selection.single() {
+            let col = tab.selection.cell.unwrap_or(0).min(rs.columns.len().saturating_sub(1));
+            if !tab.edits.deletes.contains(&row) {
+                let value = tab.edits.updates.get(&(row, col)).cloned().unwrap_or_else(|| rs.rows[row][col].clone());
+                let buffer = if value.is_null() { String::new() } else { value.to_string() };
+                tab.editing = Some(EditingCell::new(RowRef::Existing(row), col, buffer));
+            }
+        }
     }
 
     // ----- status bar ------------------------------------------------------
@@ -1740,11 +1977,34 @@ impl Console {
     }
 
     /// Holds `action` behind a confirmation when it would discard pending edits.
+    /// On a read-only connection, refuses runs with statements that may write.
+    fn block_writes(&mut self, action: Option<ConsoleAction>, read_only: bool) -> Option<ConsoleAction> {
+        let a = action?;
+        let ConsoleAction::Run { statements, .. } = &a else { return Some(a) };
+        if !read_only {
+            return Some(a);
+        }
+        let allowed = |sql: &str| {
+            is_read_only_query(sql) || {
+                let word = sql_format::first_word(sql).to_ascii_uppercase();
+                matches!(word.as_str(), "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "END" | "SET" | "DESCRIBE" | "DESC")
+            }
+        };
+        match statements.iter().find(|(sql, _)| !allowed(sql)) {
+            None => Some(a),
+            Some((sql, _)) => {
+                let head: String = sql.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+                self.tx_notice = Some(Err(format!("Read-only connection: \"{head} …\" was not run")));
+                None
+            }
+        }
+    }
+
     /// Holds a run with an UPDATE / DELETE that has no WHERE until confirmed.
     fn hold_unrestricted(&mut self, action: Option<ConsoleAction>) -> Option<ConsoleAction> {
         let a = action?;
         let ConsoleAction::Run { statements, mode: RunMode::Fresh, .. } = &a else { return Some(a) };
-        let targets: Vec<String> =
+        let targets: Vec<(String, &'static str)> =
             statements.iter().filter_map(|(sql, _)| sql_format::unrestricted_write(sql)).collect();
         if targets.is_empty() {
             return Some(a);
@@ -1758,17 +2018,19 @@ impl Console {
         let mut decision = None;
         let modal = egui::Modal::new(egui::Id::new(("unrestricted", self.id))).show(ui.ctx(), |ui| {
             ui.set_width(420.0);
-            ui.heading("Change every row?");
+            ui.heading("Run destructive statement?");
             ui.add_space(6.0);
-            let one = targets.len() == 1;
-            ui.label(if one {
-                "This statement has no WHERE clause, so it affects every row of the table:"
+            ui.label(if targets.len() == 1 {
+                "This statement can't be undone easily:"
             } else {
-                "These statements have no WHERE clause, so they affect every row of their tables:"
+                "These statements can't be undone easily:"
             });
             ui.add_space(4.0);
-            for t in targets {
-                ui.label(RichText::new(format!("•  {t}")).font(theme::mono(12.5)));
+            for (target, reason) in targets {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("•  {target}")).font(theme::mono(12.5)));
+                    ui.label(RichText::new(format!("— {reason}")).color(color::TEXT_WEAK));
+                });
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -2461,5 +2723,25 @@ fn value_text(value: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         v => v.to_string(),
+    }
+}
+
+/// Adds copies of the selected rows as new rows, in the order they are shown.
+fn duplicate_selected(
+    rs: &ResultSet,
+    edits: &mut Edits,
+    selection: &Selection,
+    sort: &SortState,
+    t: &EditTarget,
+    details: Option<&TableDetails>,
+    dialect: Dialect,
+) {
+    let mut order: Vec<usize> = sort.order().iter().copied().filter(|r| selection.rows.contains(r)).collect();
+    if order.is_empty() {
+        order = selection.rows.iter().copied().collect();
+    }
+    for r in order {
+        let copy = edits::duplicate(rs, edits, r, t, details, dialect);
+        edits.inserts.push(copy);
     }
 }

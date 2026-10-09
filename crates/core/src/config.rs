@@ -14,6 +14,9 @@ pub struct DataSourceConfig {
     /// Colour tag shown on the connection's tabs, e.g. red for production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<ConnColor>,
+    /// Block statements and grid edits that change data or schema.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

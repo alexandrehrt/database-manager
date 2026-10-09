@@ -7,4 +7,4 @@ edition.workspace = true
 dbm-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata", "modern_sqlite"] }

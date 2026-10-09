@@ -732,8 +732,13 @@ impl App {
                             c.active_result = c.results.len() - 1;
                         }
                         _ => {
+                            let failed = tab.outcome.is_err();
                             c.results.push(tab);
                             c.active_result = c.results.len() - 1;
+                            // A failed statement run from the editor: put the cursor on the error.
+                            if failed && matches!(mode, RunMode::Fresh) {
+                                c.reveal_error(c.active_result);
+                            }
                         }
                     }
                     source = Some(c.source.clone());
@@ -1104,8 +1109,10 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (i, c) in self.tabs.iter().enumerate() {
-                            let tag = self.source(&c.source).and_then(|s| s.color).map(theme::conn_color);
-                            match tab_button(ui, c, i == self.active_tab, tag) {
+                            let source = self.source(&c.source);
+                            let tag = source.and_then(|s| s.color).map(theme::conn_color);
+                            let read_only = source.is_some_and(|s| s.read_only);
+                            match tab_button(ui, c, i == self.active_tab, tag, read_only) {
                                 TabClick::Activate => activate = Some(i),
                                 TabClick::Close => close = Some(i),
                                 TabClick::None => {}
@@ -1147,6 +1154,7 @@ impl eframe::App for App {
                 tables,
                 incoming: self.incoming_cache.get(&c.source).unwrap_or(&no_incoming),
                 catalog: &catalog,
+                read_only: self.sources.iter().any(|s| s.id == c.source && s.read_only),
             };
             if let Some(a) = c.show(ui, &cx) {
                 console_actions.push((c.id, a));
@@ -1200,7 +1208,13 @@ enum TabClick {
 /// One tab of the strip: icon, title, a dot while edits are pending or a
 /// transaction is open, and a close button on the active or hovered tab.
 /// `tag`: the connection's colour (strong, tint), if it has one.
-fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool, tag: Option<(Color32, Color32)>) -> TabClick {
+fn tab_button(
+    ui: &mut egui::Ui,
+    c: &Console,
+    active: bool,
+    tag: Option<(Color32, Color32)>,
+    read_only: bool,
+) -> TabClick {
     let glyph = if c.table.is_some() { icon::TABLE } else { icon::TERMINAL_WINDOW };
     let mut click = TabClick::None;
     let fill = match (tag, active) {
@@ -1225,6 +1239,10 @@ fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool, tag: Option<(Color32
             } else {
                 title.color(color::TEXT_WEAK)
             });
+            if read_only {
+                ui.label(RichText::new(icon::LOCK_SIMPLE).size(11.0).color(color::TEXT_WEAK))
+                    .on_hover_text("Read-only connection");
+            }
             if c.file_dirty() && !c.has_pending_edits() && !c.in_transaction {
                 ui.label(RichText::new("●").size(8.0).color(color::TEXT_WEAK))
                     .on_hover_text("Unsaved changes to the file");

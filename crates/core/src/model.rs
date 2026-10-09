@@ -140,11 +140,13 @@ pub struct DbError {
     pub message: String,
     pub detail: Option<String>,
     pub code: Option<String>,
+    /// Where in the statement the error is, as a 0-based character offset.
+    pub position: Option<usize>,
 }
 
 impl DbError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), detail: None, code: None }
+        Self { message: message.into(), detail: None, code: None, position: None }
     }
 }
 
