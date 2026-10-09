@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI apps: no console window next to the app.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod persist;
 mod ui;

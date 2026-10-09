@@ -1,0 +1,59 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            artifact: database-manager-windows-x64
+            binary: database-manager.exe
+          - name: macOS arm64
+            os: macos-latest
+            artifact: database-manager-macos-arm64
+            binary: database-manager
+          - name: Linux x64
+            os: ubuntu-latest
+            artifact: database-manager-linux-x64
+            binary: database-manager
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libgl1-mesa-dev libssl-dev pkg-config libdbus-1-dev
+
+      # rust-toolchain.toml pins the version; this installs it with clippy and rustfmt.
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Build release
+        run: cargo build --release -p database-manager
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
