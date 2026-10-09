@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use dbm_core::ExecOutcome;
 use dbm_core::config::DataSourceConfig;
 use dbm_core::fk_nav::ForeignKeyIndex;
+use dbm_core::{ExecOutcome, TableDetails};
 use eframe::egui;
 
 use crate::persist;
@@ -83,6 +83,8 @@ pub struct App {
     quit_confirmed: bool,
     /// Foreign keys per data source, filled from table details as results need them.
     fk_cache: HashMap<String, ForeignKeyIndex>,
+    /// Table details per data source, for deciding whether results are editable.
+    table_cache: HashMap<String, HashMap<(String, String), TableDetails>>,
     fk_pending: HashSet<(String, String, String)>,
 }
 
@@ -108,6 +110,7 @@ impl App {
             confirm: None,
             quit_confirmed: false,
             fk_cache: HashMap::new(),
+            table_cache: HashMap::new(),
             fk_pending: HashSet::new(),
         }
     }
@@ -191,6 +194,7 @@ impl App {
             done: 0,
             mode,
             params: statements.iter().map(|(_, p)| p.clone()).collect(),
+            limit,
         });
         let begin_first = tx_mode == TxMode::Manual;
         self.worker.run_statements(conn, console_id, run_id, statements, limit, stop, begin_first);
@@ -202,14 +206,9 @@ impl App {
         if let Some(c) = self.console_mut(console_id) {
             c.results = pending
                 .into_iter()
-                .map(|p| ResultTab {
-                    title: None,
-                    sql: p.statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(";\n"),
-                    params: Vec::new(),
-                    outcome: Err(error.clone()),
-                    elapsed: Default::default(),
-                    limit: p.limit,
-                    sort: Default::default(),
+                .map(|p| {
+                    let sql = p.statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(";\n");
+                    ResultTab::new(None, sql, Vec::new(), Err(error.clone()))
                 })
                 .collect();
             c.active_result = 0;
@@ -227,6 +226,7 @@ impl App {
     /// the server rolls back their open transactions.
     fn disconnect_source(&mut self, id: &str) {
         self.fk_cache.remove(id);
+        self.table_cache.remove(id);
         self.worker.disconnect(id);
         self.trees.remove(id);
         let consoles: Vec<u64> = self.consoles().filter(|c| c.source == id).map(|c| c.id).collect();
@@ -324,6 +324,25 @@ impl App {
                 }
                 Err(e) => self.fail_pending(console, e),
             },
+            Event::EditsSubmitted { console, tab, result, in_transaction } => {
+                let mut refresh = None;
+                if let Some(c) = self.console_mut(console) {
+                    c.in_transaction = in_transaction;
+                    if let Some(t) = c.results.get_mut(tab) {
+                        t.submitting = false;
+                        match result {
+                            Ok(()) => {
+                                t.edits = Default::default();
+                                refresh = Some((vec![(t.sql.clone(), t.params.clone())], t.limit));
+                            }
+                            Err(e) => t.edit_error = Some(e),
+                        }
+                    }
+                }
+                if let Some((statements, limit)) = refresh {
+                    self.start_run(console, statements, limit, RunMode::Replace(tab));
+                }
+            }
             Event::ControlDone { console, sql, result, in_transaction } => {
                 if let Some(c) = self.console_mut(console) {
                     c.tx_busy = false;
@@ -348,25 +367,19 @@ impl App {
                     r.done = index + 1;
                     c.in_transaction = in_transaction;
                     let mode = r.mode.clone();
-                    let tab = ResultTab {
-                        title: None,
-                        sql: result.sql.clone(),
-                        params: r.params.get(index).cloned().unwrap_or_default(),
-                        outcome: result.outcome,
-                        elapsed: result.elapsed,
-                        limit: PAGE_SIZE,
-                        sort: Default::default(),
-                    };
+                    let params = r.params.get(index).cloned().unwrap_or_default();
+                    let mut tab = ResultTab::new(None, result.sql.clone(), params, result.outcome);
+                    tab.elapsed = result.elapsed;
+                    tab.limit = r.limit;
                     match mode {
                         RunMode::Replace(i) if i < c.results.len() => {
-                            let old = &c.results[i];
-                            let (limit, title, sort_column) =
-                                (old.limit + PAGE_SIZE, old.title.clone(), old.sort.column);
-                            c.results[i] = ResultTab { limit, title, ..tab };
-                            c.results[i].sort.column = sort_column;
+                            tab.title = c.results[i].title.clone();
+                            tab.sort.column = c.results[i].sort.column;
+                            c.results[i] = tab;
                         }
                         RunMode::Navigate { from, title } => {
-                            c.results.push(ResultTab { title: Some(title), ..tab });
+                            tab.title = Some(title);
+                            c.results.push(tab);
                             c.nav_back.push(from);
                             c.nav_forward.clear();
                             c.active_result = c.results.len() - 1;
@@ -444,6 +457,10 @@ impl App {
                         .entry(source.clone())
                         .or_default()
                         .insert((schema.clone(), table.clone()), d.foreign_keys.clone());
+                    self.table_cache
+                        .entry(source.clone())
+                        .or_default()
+                        .insert((schema.clone(), table.clone()), d.clone());
                 }
                 if let Loadable::Loaded(schemas) = &mut self.tree(&source).schemas
                     && let Some(node) = schemas.iter_mut().find(|s| s.name == schema)
@@ -483,6 +500,7 @@ impl App {
             }
             Action::Refresh(id) => {
                 self.fk_cache.remove(&id);
+                self.table_cache.remove(&id);
                 self.tree(&id).schemas = Loadable::NotLoaded;
             }
             Action::LoadSchemas(source) => {
@@ -658,6 +676,7 @@ impl eframe::App for App {
 
         let mut console_actions = Vec::new();
         let no_fks = ForeignKeyIndex::new();
+        let no_tables = HashMap::new();
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tabs.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -691,7 +710,8 @@ impl eframe::App for App {
                 Tab::Console(c) => {
                     let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
                     let fks = self.fk_cache.get(&c.source).unwrap_or(&no_fks);
-                    if let Some(a) = c.show(ui, history, fks) {
+                    let tables = self.table_cache.get(&c.source).unwrap_or(&no_tables);
+                    if let Some(a) = c.show(ui, history, fks, tables) {
                         console_actions.push((c.id, a));
                     }
                 }
@@ -712,6 +732,17 @@ impl eframe::App for App {
                         if let Some(conn) = self.worker.console_connection(console) {
                             self.worker.cancel(conn);
                         }
+                    }
+                }
+                ConsoleAction::SubmitEdits { tab, statements } => {
+                    if let Some(conn) = self.worker.console_connection(console)
+                        && let Some(c) = self.console_mut(console)
+                        && let Some(t) = c.results.get_mut(tab)
+                    {
+                        t.submitting = true;
+                        t.edit_error = None;
+                        t.editing = None;
+                        self.worker.submit_edits(conn, console, tab, statements);
                     }
                 }
                 ConsoleAction::Commit | ConsoleAction::Rollback => {

@@ -64,6 +64,13 @@ pub enum Event {
         result: DbResult<()>,
         in_transaction: bool,
     },
+    /// Grid edits of result tab `tab` were applied (or failed and were rolled back).
+    EditsSubmitted {
+        console: u64,
+        tab: usize,
+        result: Result<(), String>,
+        in_transaction: bool,
+    },
     Ddl {
         tab: u64,
         result: DbResult<String>,
@@ -211,6 +218,23 @@ impl Worker {
         });
     }
 
+    /// Applies grid edits. Outside a transaction they get one of their own, so
+    /// either all apply or none; inside the user's transaction they join it
+    /// and the user commits.
+    pub fn submit_edits(
+        &self,
+        conn: SharedConnection,
+        console: u64,
+        tab: usize,
+        statements: Vec<(String, Vec<Value>, bool)>,
+    ) {
+        self.spawn(async move {
+            let own_transaction = !conn.in_transaction().await;
+            let result = apply_edits(conn.as_ref(), statements, own_transaction).await;
+            Event::EditsSubmitted { console, tab, result, in_transaction: conn.in_transaction().await }
+        });
+    }
+
     pub fn details(&self, conn: SharedConnection, source: String, schema: String, table: String) {
         self.spawn(async move {
             let result = conn.table_details(&schema, &table).await;
@@ -236,6 +260,36 @@ impl Worker {
             self.spawn(f(conn));
         }
     }
+}
+
+async fn apply_edits(
+    conn: &dyn Connection,
+    statements: Vec<(String, Vec<Value>, bool)>,
+    own_transaction: bool,
+) -> Result<(), String> {
+    if own_transaction {
+        conn.execute("BEGIN", &[], None).await.map_err(|e| format!("BEGIN failed: {}", e.message))?;
+    }
+    for (sql, params, expect_one) in statements {
+        let failure = match conn.execute(&sql, &params, None).await {
+            Ok(dbm_core::ExecOutcome::Affected(n)) if expect_one && n != 1 => Some(format!(
+                "{sql}\naffected {n} rows instead of 1; the row may have been changed or deleted meanwhile"
+            )),
+            Ok(_) => None,
+            Err(e) => Some(format!("{sql}\n{}", e.message)),
+        };
+        if let Some(message) = failure {
+            if own_transaction {
+                let _ = conn.execute("ROLLBACK", &[], None).await;
+                return Err(format!("Nothing was saved. {message}"));
+            }
+            return Err(format!("{message}\nThe console's transaction is still open; roll back or fix and retry."));
+        }
+    }
+    if own_transaction {
+        conn.execute("COMMIT", &[], None).await.map_err(|e| format!("COMMIT failed: {}", e.message))?;
+    }
+    Ok(())
 }
 
 async fn open(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
