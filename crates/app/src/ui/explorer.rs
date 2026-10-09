@@ -199,7 +199,10 @@ fn relations(
             ui.weak("(empty)");
         }
         Loadable::Loaded(nodes) => {
-            for (label, kinds) in [("tables", vec![RelationKind::Table]), ("views", vec![RelationKind::View, RelationKind::MaterializedView])] {
+            for (label, kinds) in [
+                ("tables", vec![RelationKind::Table]),
+                ("views", vec![RelationKind::View, RelationKind::MaterializedView]),
+            ] {
                 let count = nodes.iter().filter(|n| kinds.contains(&n.relation.kind)).count();
                 if count == 0 {
                     continue;
@@ -219,7 +222,8 @@ fn relations(
 
 fn relation_node(ui: &mut egui::Ui, source: &str, schema: &str, node: &mut RelationNode, actions: &mut Vec<Action>) {
     let name = node.relation.name.clone();
-    let open_table = || Action::OpenTable { source: source.to_string(), schema: schema.to_string(), table: name.clone() };
+    let open_table =
+        || Action::OpenTable { source: source.to_string(), schema: schema.to_string(), table: name.clone() };
     let response = egui::CollapsingHeader::new(&name)
         .id_salt(("relation", source, schema, &name))
         .show(ui, |ui| match &mut node.details {
@@ -242,7 +246,11 @@ fn relation_node(ui: &mut egui::Ui, source: &str, schema: &str, node: &mut Relat
             actions.push(open_table());
         }
         if ui.button("Show DDL").clicked() {
-            actions.push(Action::ShowDdl { source: source.to_string(), schema: schema.to_string(), table: name.clone() });
+            actions.push(Action::ShowDdl {
+                source: source.to_string(),
+                schema: schema.to_string(),
+                table: name.clone(),
+            });
         }
     });
 }
@@ -298,7 +306,13 @@ fn table_details(ui: &mut egui::Ui, d: &TableDetails) {
             .id_salt(("indexes", &d.schema, &d.name))
             .show(ui, |ui| {
                 for idx in &d.indexes {
-                    let kind = if idx.primary { " primary" } else if idx.unique { " unique" } else { "" };
+                    let kind = if idx.primary {
+                        " primary"
+                    } else if idx.unique {
+                        " unique"
+                    } else {
+                        ""
+                    };
                     ui.horizontal(|ui| {
                         ui.label(&idx.name);
                         ui.weak(format!("({}){kind}", idx.columns.join(", ")));

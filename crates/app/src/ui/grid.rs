@@ -117,7 +117,10 @@ pub fn show(
                                 }
                                 r.on_hover_text("Open the referenced row")
                             } else {
-                                ui.add(egui::Label::new(RichText::new(cell_text(value)).text_style(mono.clone())).truncate())
+                                ui.add(
+                                    egui::Label::new(RichText::new(cell_text(value)).text_style(mono.clone()))
+                                        .truncate(),
+                                )
                             };
                             response.context_menu(|ui| {
                                 if ui.button("Copy value").clicked() {

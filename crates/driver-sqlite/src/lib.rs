@@ -160,7 +160,9 @@ fn table_details(conn: &rusqlite::Connection, schema: &str, name: &str) -> rusql
     let mut indexes = Vec::new();
     let index_rows = conn
         .prepare("SELECT name, \"unique\", origin FROM pragma_index_list(?1, ?2) ORDER BY name")?
-        .query_map(params![name, schema], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, String>(2)?)))?
+        .query_map(params![name, schema], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, String>(2)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (index_name, unique, origin) in index_rows {
         let cols = conn
@@ -170,7 +172,10 @@ fn table_details(conn: &rusqlite::Connection, schema: &str, name: &str) -> rusql
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let definition = conn
             .query_row(
-                &format!("SELECT sql FROM {}.sqlite_schema WHERE type = 'index' AND name = ?1", Dialect::Sqlite.quote_ident(schema)),
+                &format!(
+                    "SELECT sql FROM {}.sqlite_schema WHERE type = 'index' AND name = ?1",
+                    Dialect::Sqlite.quote_ident(schema)
+                ),
                 [&index_name],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -283,7 +288,8 @@ impl Connection for SqliteConnection {
         );
         let name = name.to_string();
         self.blocking(move |c| {
-            let parts: Vec<String> = c.prepare(&sql)?.query_map([&name], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let parts: Vec<String> =
+                c.prepare(&sql)?.query_map([&name], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             Ok(parts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n\n"))
         })
         .await

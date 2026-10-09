@@ -52,9 +52,7 @@ impl Value {
     pub fn to_param_text(&self) -> Option<String> {
         match self {
             Value::Null => None,
-            Value::Float(f) if f.is_infinite() => {
-                Some(if *f > 0.0 { "Infinity" } else { "-Infinity" }.into())
-            }
+            Value::Float(f) if f.is_infinite() => Some(if *f > 0.0 { "Infinity" } else { "-Infinity" }.into()),
             other => Some(other.to_string()),
         }
     }

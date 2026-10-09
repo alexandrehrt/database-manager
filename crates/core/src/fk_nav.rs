@@ -21,25 +21,19 @@ pub struct FkLink {
 pub fn link_for_cell(columns: &[Column], row: &[Value], col: usize, fks: &ForeignKeyIndex) -> Option<FkLink> {
     let origin = columns.get(col)?.origin.as_ref()?;
     let candidates = fks.get(&(origin.schema.clone(), origin.table.clone()))?;
-    candidates
-        .iter()
-        .filter(|fk| fk.columns.contains(&origin.column))
-        .find_map(|fk| {
-            let values = fk
-                .columns
-                .iter()
-                .map(|fk_col| {
-                    let wanted = ColumnOrigin {
-                        schema: origin.schema.clone(),
-                        table: origin.table.clone(),
-                        column: fk_col.clone(),
-                    };
-                    let idx = columns.iter().position(|c| c.origin.as_ref() == Some(&wanted))?;
-                    row.get(idx).filter(|v| !v.is_null()).cloned()
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(FkLink { foreign_key: fk.clone(), values })
-        })
+    candidates.iter().filter(|fk| fk.columns.contains(&origin.column)).find_map(|fk| {
+        let values = fk
+            .columns
+            .iter()
+            .map(|fk_col| {
+                let wanted =
+                    ColumnOrigin { schema: origin.schema.clone(), table: origin.table.clone(), column: fk_col.clone() };
+                let idx = columns.iter().position(|c| c.origin.as_ref() == Some(&wanted))?;
+                row.get(idx).filter(|v| !v.is_null()).cloned()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(FkLink { foreign_key: fk.clone(), values })
+    })
 }
 
 /// Parameterised `SELECT * FROM <referenced table> WHERE <ref cols> = <values>`.
