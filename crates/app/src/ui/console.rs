@@ -24,6 +24,7 @@ pub const PAGE_SIZE: usize = 500;
 const RUN_STATEMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const RUN_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Enter);
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 
 /// SQL plus its bound parameters.
 pub type Statement = (String, Vec<Value>);
@@ -203,6 +204,8 @@ pub struct Console {
     panel: Option<RowPanel>,
     /// The statements "View SQL" shows.
     view_sql: Option<String>,
+    /// Result tab whose refresh waits for the user to discard pending edits.
+    confirm_refresh: Option<usize>,
     /// Rows of the statement under the cursor last frame, for its highlight.
     statement_rect: Option<egui::Rect>,
 }
@@ -258,6 +261,7 @@ impl Console {
             panel_open: true,
             panel: None,
             view_sql: None,
+            confirm_refresh: None,
             statement_rect: None,
         }
     }
@@ -296,6 +300,9 @@ impl Console {
             action = Some(a);
         }
         self.view_sql_modal(ui);
+        if let Some(a) = self.refresh_confirm_modal(ui) {
+            action = Some(a);
+        }
         action
     }
 
@@ -740,6 +747,7 @@ impl Console {
         };
         let editable = matches!(target, Some(Ok(_)));
         let mut close_result = None;
+        let mut refresh = ui.input_mut(|i| i.consume_shortcut(&REFRESH));
 
         // Chips, result tabs and the + Row / Export buttons.
         egui::Panel::top(egui::Id::new(("results-bar", self.id)))
@@ -758,6 +766,14 @@ impl Console {
                         action = Some(a);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let shortcut = ui.ctx().format_shortcut(&REFRESH);
+                        if ui
+                            .add_enabled(!running, egui::Button::new(format!("{}  Refresh", icon::ARROWS_CLOCKWISE)))
+                            .on_hover_text(format!("Run this result's query again ({shortcut})"))
+                            .clicked()
+                        {
+                            refresh = true;
+                        }
                         let tab = &mut self.results[idx];
                         if let Ok(ExecOutcome::Rows(rs)) = &tab.outcome {
                             ui.menu_button(format!("{}  Export  {}", icon::DOWNLOAD_SIMPLE, icon::CARET_DOWN), |ui| {
@@ -817,6 +833,12 @@ impl Console {
                 action = Some(a);
             }
         });
+        if refresh
+            && !running
+            && let Some(a) = self.request_refresh(idx)
+        {
+            action = Some(a);
+        }
         if let Some(i) = close_result {
             self.close_result(i);
         }
@@ -1179,6 +1201,66 @@ impl Console {
             });
         });
         action
+    }
+
+    /// Re-runs result tab `idx` in place with its SQL, parameters and row limit.
+    fn refresh(&self, idx: usize) -> Option<ConsoleAction> {
+        let tab = self.results.get(idx)?;
+        Some(ConsoleAction::Run {
+            statements: vec![(tab.sql.clone(), tab.params.clone())],
+            limit: tab.limit,
+            mode: RunMode::Replace(idx),
+        })
+    }
+
+    /// Refreshes, first asking if the tab has pending grid edits.
+    fn request_refresh(&mut self, idx: usize) -> Option<ConsoleAction> {
+        if self.results.get(idx).is_some_and(|t| t.edits.row_count() > 0) {
+            self.confirm_refresh = Some(idx);
+            return None;
+        }
+        self.refresh(idx)
+    }
+
+    fn refresh_confirm_modal(&mut self, ui: &egui::Ui) -> Option<ConsoleAction> {
+        let idx = self.confirm_refresh?;
+        let pending = self.results.get(idx).map_or(0, |t| t.edits.row_count());
+        let mut decision = None;
+        let modal = egui::Modal::new(egui::Id::new(("confirm-refresh", self.id))).show(ui.ctx(), |ui| {
+            ui.set_width(380.0);
+            ui.heading("Discard pending changes?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "Refreshing reloads the rows and discards {pending} unsaved change{}.",
+                if pending == 1 { "" } else { "s" }
+            ));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button("Discard and refresh")).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        });
+        if decision.is_none() && modal.should_close() {
+            decision = Some(false);
+        }
+        let proceed = decision?;
+        self.confirm_refresh = None;
+        if !proceed || self.run.is_some() {
+            return None;
+        }
+        if let Some(tab) = self.results.get_mut(idx) {
+            tab.edits = Edits::default();
+            tab.editing = None;
+            tab.edit_error = None;
+        }
+        self.panel = None;
+        self.refresh(idx)
     }
 
     fn view_sql_modal(&mut self, ui: &egui::Ui) {
