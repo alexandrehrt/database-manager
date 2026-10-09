@@ -12,6 +12,19 @@ You need Rust 1.95. `rust-toolchain.toml` pins it, so rustup installs it automat
 cargo run --release -p database-manager
 ```
 
+## Install on macOS
+
+```sh
+scripts/bundle-macos.sh ~/Downloads
+```
+
+This builds `Database Manager.app`. Drag it into **Applications** and open it from there or from Spotlight. The app is
+signed ad hoc, which is enough on the Mac that built it; sharing it with other Macs needs an Apple Developer ID signature
+and notarization (#56).
+
+CI also builds the program for Windows (`database-manager.exe`), macOS and Linux on every push to `main`; download it
+from the run's **Artifacts** on the Actions tab.
+
 ## Try it with the sample database
 
 `fixtures/seed.sql` loads into both engines. It has customers, orders (some with a NULL customer), order items, products, and shipments that reference order items through a composite foreign key.
