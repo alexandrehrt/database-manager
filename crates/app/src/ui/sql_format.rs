@@ -10,7 +10,7 @@ use crate::ui::sql_highlight::KEYWORDS;
 const INDENT: &str = "    ";
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok<'a> {
+pub(crate) enum Tok<'a> {
     Word(&'a str),
     /// Literal text copied verbatim: strings, quoted identifiers, dollar bodies, placeholders.
     Verbatim(&'a str),
@@ -20,7 +20,7 @@ enum Tok<'a> {
 }
 
 /// Tokens, each with whether whitespace preceded it in the input.
-fn tokenize(sql: &str) -> Vec<(Tok<'_>, bool)> {
+pub(crate) fn tokenize(sql: &str) -> Vec<(Tok<'_>, bool)> {
     let b = sql.as_bytes();
     let mut out: Vec<Tok<'_>> = Vec::new();
     let mut raw = Vec::new();
@@ -115,7 +115,7 @@ fn upper(word: &str) -> String {
     word.to_ascii_uppercase()
 }
 
-fn is_keyword(word: &str) -> bool {
+pub(crate) fn is_keyword(word: &str) -> bool {
     KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(word))
 }
 

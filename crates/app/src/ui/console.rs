@@ -17,7 +17,7 @@ use crate::ui::completion::{self, Catalog, Item};
 use crate::ui::edits::{self, EditStatement, EditTarget, Edits, RowRef};
 use crate::ui::grid::{self, ColumnMeta, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
 use crate::ui::theme::{self, color, icon};
-use crate::ui::{editor_ops, sql_format, sql_highlight};
+use crate::ui::{editor_ops, inspect, sql_format, sql_highlight};
 
 pub const PAGE_SIZE: usize = 500;
 
@@ -282,6 +282,10 @@ pub struct Console {
     /// A run held for confirmation: UPDATE / DELETE statements without WHERE.
     unrestricted: Option<(ConsoleAction, Vec<(String, &'static str)>)>,
     param_prompt: Option<ParamPrompt>,
+    /// Inspection results for the editor text, and what they were computed
+    /// from (text, loaded tables, loaded table details).
+    issues: Vec<inspect::Issue>,
+    inspected: Option<(String, usize, usize)>,
     /// Last values typed for each parameter name.
     param_values: HashMap<String, ParamValue>,
     /// Put the editor cursor at this byte offset next frame (an error position).
@@ -364,6 +368,8 @@ impl Console {
             find: None,
             unrestricted: None,
             param_prompt: None,
+            issues: Vec::new(),
+            inspected: None,
             param_values: HashMap::new(),
             jump_to: None,
             reveal_byte: None,
@@ -550,6 +556,7 @@ impl Console {
             self.select_in_editor(ui.ctx(), editor_id, at..at);
             self.reveal_byte = Some(at);
         }
+        self.run_inspections(cx);
         let mut editor_out = None;
         let mut marker_run = None;
 
@@ -606,6 +613,23 @@ impl Console {
                             ui.label(RichText::new(path.display().to_string()).small().color(color::TEXT_WEAK));
                         }
                     });
+                    if !self.issues.is_empty() {
+                        let errors = self.issues.iter().any(|i| i.severity == inspect::Severity::Error);
+                        let tint = if errors { color::DANGER } else { color::WARNING };
+                        let list: Vec<String> = self.issues.iter().map(|i| format!("• {}", i.message)).collect();
+                        let r = ui
+                            .add(theme::flat_button(
+                                RichText::new(format!("{}  {}", icon::WARNING, self.issues.len())).color(tint),
+                            ))
+                            .on_hover_text(format!("{}\n\nClick to go to the first one.", list.join("\n")));
+                        if r.clicked() {
+                            let first = self.issues[0].range.clone();
+                            if first.end <= self.sql.len() {
+                                self.select_in_editor(ui.ctx(), editor_id, first.clone());
+                                self.reveal_byte = Some(first.start);
+                            }
+                        }
+                    }
                     ui.menu_button(format!("{}  Edit", icon::PENCIL_SIMPLE), |ui| {
                         let ctx = ui.ctx().clone();
                         if ui
@@ -710,6 +734,7 @@ impl Console {
                             // Minimal scrolling: just enough to bring it into view.
                             ui.scroll_to_rect(rect.translate(output.galley_pos.to_vec2()), None);
                         }
+                        self.paint_issues(ui, gutter, &output.galley, output.galley_pos);
                         marker_run = self.paint_gutter(ui, gutter, &output.galley, output.galley_pos, cursor);
                         editor_out = Some((
                             output.response.response.changed(),
@@ -752,6 +777,78 @@ impl Console {
             }
         }
         action
+    }
+
+    /// Re-inspects the editor text when it or the loaded metadata changed.
+    fn run_inspections(&mut self, cx: &ConsoleContext<'_>) {
+        let (tables, details) = (cx.catalog.tables.len(), cx.catalog.details.len());
+        if self.inspected.as_ref().is_some_and(|(s, t, d)| *s == self.sql && *t == tables && *d == details) {
+            return;
+        }
+        let key = (self.sql.clone(), tables, details);
+        let mut wanted = Vec::new();
+        self.issues = inspect::inspect(&self.sql, self.dialect, cx.catalog, &mut wanted);
+        for w in wanted {
+            if !self.wanted_details.contains(&w) {
+                self.wanted_details.push(w);
+            }
+        }
+        self.inspected = Some(key);
+    }
+
+    /// Squiggly underlines under inspection issues, their message on hover, and
+    /// a dot in the gutter on their line.
+    fn paint_issues(&self, ui: &egui::Ui, gutter: egui::Rect, galley: &Arc<egui::Galley>, galley_pos: egui::Pos2) {
+        // Issues belong to the text they were computed from; skip a frame after an edit.
+        if self.inspected.as_ref().is_none_or(|(sql, _, _)| *sql != self.sql) {
+            return;
+        }
+        let painter = ui.painter();
+        let pointer = ui.ctx().pointer_hover_pos();
+        let to_char = |byte: usize| self.sql[..byte.min(self.sql.len())].chars().count();
+        for (n, issue) in self.issues.iter().enumerate() {
+            let tint = match issue.severity {
+                inspect::Severity::Error => color::DANGER,
+                inspect::Severity::Warning => color::WARNING,
+            };
+            let a = galley.pos_from_cursor(egui::text::CCursor::new(to_char(issue.range.start)));
+            let b = galley.pos_from_cursor(egui::text::CCursor::new(to_char(issue.range.end)));
+            // Multi-line ranges are underlined to the end of their first line.
+            let right = if (a.top() - b.top()).abs() < 1.0 {
+                b.left()
+            } else {
+                galley
+                    .rows
+                    .iter()
+                    .map(|r| r.rect())
+                    .find(|r| r.top() <= a.center().y && a.center().y <= r.bottom())
+                    .map_or(a.left() + 40.0, |r| r.right())
+            };
+            let x0 = galley_pos.x + a.left();
+            let x1 = (galley_pos.x + right).max(x0 + 6.0);
+            let y = galley_pos.y + a.bottom() - 1.0;
+            let mut points = Vec::new();
+            let mut x = x0;
+            let mut up = true;
+            while x < x1 {
+                points.push(egui::pos2(x, if up { y } else { y + 2.0 }));
+                x += 2.5;
+                up = !up;
+            }
+            points.push(egui::pos2(x1, if up { y } else { y + 2.0 }));
+            painter.add(egui::Shape::line(points, Stroke::new(1.0, tint)));
+            painter.circle_filled(egui::pos2(gutter.left() + 3.0, galley_pos.y + a.center().y), 2.5, tint);
+            let hit = egui::Rect::from_min_max(egui::pos2(x0, galley_pos.y + a.top()), egui::pos2(x1, y + 3.0));
+            if pointer.is_some_and(|p| hit.contains(p)) {
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
+                    ui.layer_id(),
+                    egui::Id::new(("issue", self.id, n)),
+                    egui::PopupAnchor::Pointer,
+                )
+                .show(|ui| ui.label(&issue.message));
+            }
+        }
     }
 
     /// Line numbers, a ▸ marker at each statement start (click to run it) and
