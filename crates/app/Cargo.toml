@@ -19,3 +19,4 @@ rfd = "0.17"
 keyring = "4"
 toml = "1"
 dirs = "7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

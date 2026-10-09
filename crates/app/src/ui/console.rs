@@ -1169,6 +1169,53 @@ impl Console {
                             {
                                 tab.edits.inserts.push(vec![None; rs.columns.len()]);
                             }
+                            if let Some(Ok(t)) = &target {
+                                let selected: Vec<usize> = tab.selection.rows.iter().copied().collect();
+                                let can = !running && !tab.submitting && !selected.is_empty();
+                                let n = selected.len();
+                                let all_deleted = can && selected.iter().all(|r| tab.edits.deletes.contains(r));
+                                let (label, tip) = if all_deleted {
+                                    (
+                                        format!("{}  Undo delete", icon::ARROW_COUNTER_CLOCKWISE),
+                                        "Keep the selected rows",
+                                    )
+                                } else {
+                                    (
+                                        format!("{}  Delete", icon::TRASH),
+                                        "Mark the selected rows for deletion; Save applies it",
+                                    )
+                                };
+                                if ui
+                                    .add_enabled(can, egui::Button::new(label))
+                                    .on_hover_text(tip)
+                                    .on_disabled_hover_text("Select rows first")
+                                    .clicked()
+                                {
+                                    for r in &selected {
+                                        if all_deleted {
+                                            tab.edits.deletes.remove(r);
+                                        } else {
+                                            tab.edits.deletes.insert(*r);
+                                        }
+                                    }
+                                }
+                                let dup = ui
+                                    .add_enabled(can, egui::Button::new(format!("{}  Duplicate", icon::COPY)))
+                                    .on_hover_text(format!("Add a copy of the {} selected row(s) as new rows", n))
+                                    .on_disabled_hover_text("Select rows first");
+                                if dup.clicked() {
+                                    let details = cx.tables.get(&(t.schema.clone(), t.table.clone()));
+                                    let mut order: Vec<usize> =
+                                        tab.sort.order().iter().copied().filter(|r| selected.contains(r)).collect();
+                                    if order.is_empty() {
+                                        order = selected.clone();
+                                    }
+                                    for r in order {
+                                        let copy = edits::duplicate(rs, &tab.edits, r, t, details, self.dialect);
+                                        tab.edits.inserts.push(copy);
+                                    }
+                                }
+                            }
                             if let Some(Err(reason)) = &target {
                                 ui.label(RichText::new("read-only").small().color(color::TEXT_WEAK))
                                     .on_hover_text(reason);
@@ -1185,6 +1232,7 @@ impl Console {
         if let Some(a) = self.status_bar(ui, idx, target.as_ref()) {
             action = Some(a);
         }
+        self.edit_error_banner(ui, idx);
 
         // Row panel for the selected row.
         let selected_row = match &self.results[idx].outcome {
@@ -1552,9 +1600,6 @@ impl Console {
                     }
                 }
                 self.tx_notice(ui);
-                if let Some(e) = &tab.edit_error {
-                    ui.colored_label(color::DANGER, e.lines().next().unwrap_or_default()).on_hover_text(e);
-                }
 
                 let Some(Ok(t)) = target else { return };
                 let pending = tab.edits.row_count();
@@ -1602,6 +1647,43 @@ impl Console {
             });
         });
         action
+    }
+
+    /// Why the last Save failed, above the status bar, until dismissed or saved again.
+    fn edit_error_banner(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let Some(error) = self.results[idx].edit_error.clone() else { return };
+        let (reason, sql) = error.split_once("\n\n").unwrap_or((error.as_str(), ""));
+        let mut dismiss = false;
+        egui::Panel::bottom(egui::Id::new(("edit-error", self.id)))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(253, 236, 236))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .stroke(Stroke::new(1.0, color::DANGER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::WARNING_CIRCLE).color(color::DANGER));
+                    ui.vertical(|ui| {
+                        ui.add(egui::Label::new(RichText::new(reason).color(color::DANGER)).wrap());
+                        if !sql.is_empty() {
+                            ui.add(
+                                egui::Label::new(RichText::new(sql).font(theme::mono(11.5)).color(color::TEXT_WEAK))
+                                    .truncate(),
+                            )
+                            .on_hover_text(sql);
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.add(theme::flat_button(icon::X)).on_hover_text("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            });
+        if dismiss {
+            self.results[idx].edit_error = None;
+        }
     }
 
     /// Re-runs result tab `idx` in place with its SQL, parameters and row limit.
@@ -1961,6 +2043,12 @@ impl Console {
                                 if ui.button("Set NULL").clicked() {
                                     panel.buffers[c].clear();
                                     tab.edits.set(rs, RowRef::Existing(row), c, Value::Null);
+                                }
+                                if let Some((label, now)) = edits::now_value(&col.type_name, dialect)
+                                    && ui.button(label).clicked()
+                                {
+                                    panel.buffers[c] = now.to_string();
+                                    tab.edits.set(rs, RowRef::Existing(row), c, now);
                                 }
                                 if changed && ui.button("Revert").clicked() {
                                     tab.edits.updates.remove(&(row, c));

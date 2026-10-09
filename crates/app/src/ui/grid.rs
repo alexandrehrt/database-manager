@@ -42,6 +42,11 @@ pub struct SortState {
 }
 
 impl SortState {
+    /// Data rows in the order they are shown.
+    pub fn order(&self) -> &[usize] {
+        &self.order
+    }
+
     fn toggle(&mut self, col: usize) {
         self.column = match self.column {
             Some((c, true)) if c == col => Some((col, false)),
@@ -196,6 +201,16 @@ pub fn as_bool(v: &Value, boolean_column: bool) -> Option<bool> {
     match v {
         Value::Bool(b) => Some(*b),
         Value::Int(i @ (0 | 1)) if boolean_column => Some(*i == 1),
+        Value::Text(t) if boolean_column => parse_bool(t),
+        _ => None,
+    }
+}
+
+/// Text typed into a boolean column: true / false, t / f, yes / no, 1 / 0.
+pub fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "1" => Some(true),
+        "false" | "f" | "no" | "n" | "0" => Some(false),
         _ => None,
     }
 }
@@ -405,7 +420,12 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 } else if r.lost_focus() {
                                     let text = std::mem::take(&mut cell.buffer);
                                     *e.editing = None;
-                                    e.edits.set(rs, row_ref, c, Value::Text(text));
+                                    // Typed booleans become real ones, so the cell shows a checkbox.
+                                    let value = match parse_bool(&text).filter(|_| m.boolean) {
+                                        Some(b) => Value::Bool(b),
+                                        None => Value::Text(text),
+                                    };
+                                    e.edits.set(rs, row_ref, c, value);
                                 }
                                 return;
                             }
@@ -540,6 +560,13 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 ui.separator();
                                 if !deleted && ui.button("Set NULL").clicked() {
                                     e.edits.set(rs, row_ref, c, Value::Null);
+                                }
+                                if !deleted
+                                    && let Some((label, now)) =
+                                        crate::ui::edits::now_value(&rs.columns[c].type_name, dialect)
+                                    && ui.button(label).clicked()
+                                {
+                                    e.edits.set(rs, row_ref, c, now);
                                 }
                                 match row_ref {
                                     RowRef::Existing(r) => {
