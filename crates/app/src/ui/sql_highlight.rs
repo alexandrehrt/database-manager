@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Color32, FontId, TextFormat, text::LayoutJob};
 
-const KEYWORDS: &[&str] = &[
+pub const KEYWORDS: &[&str] = &[
     "ADD",
     "ALL",
     "ALTER",

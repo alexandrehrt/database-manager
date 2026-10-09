@@ -1,3 +1,4 @@
+pub mod completion;
 pub mod console;
 pub mod datasource_dialog;
 pub mod edits;

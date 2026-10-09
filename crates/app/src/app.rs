@@ -275,6 +275,36 @@ impl App {
         }
     }
 
+    /// Loads a table's details (columns, keys) for completion, once.
+    fn request_details(&mut self, source: &str, console: u64, schema: String, table: String) {
+        let cached = self.table_cache.get(source).is_some_and(|m| m.contains_key(&(schema.clone(), table.clone())));
+        let key = (source.to_string(), schema.clone(), table.clone());
+        if cached || self.fk_pending.contains(&key) {
+            return;
+        }
+        let Some(conn) = self.worker.connection(source).or_else(|| self.worker.console_connection(console)) else {
+            return;
+        };
+        self.fk_pending.insert(key);
+        self.worker.incoming(conn.clone(), source.to_string(), schema.clone(), table.clone());
+        self.worker.details(conn, source.to_string(), schema, table);
+    }
+
+    /// (schema, table) of every loaded table and view of a source.
+    fn source_tables(&self, source: &str) -> Vec<(String, String)> {
+        let Some(SourceTree { schemas: Loadable::Loaded(schemas), .. }) = self.trees.get(source) else {
+            return Vec::new();
+        };
+        schemas
+            .iter()
+            .filter_map(|s| match &s.relations {
+                Loadable::Loaded(rels) => Some(rels.iter().map(|r| (s.name.clone(), r.relation.name.clone()))),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
@@ -822,6 +852,19 @@ impl eframe::App for App {
         let no_fks = ForeignKeyIndex::new();
         let no_tables = HashMap::new();
         let no_incoming = HashMap::new();
+        // Completion needs the active console's tables; load them in the background.
+        let active_source = match self.tabs.get(self.active_tab) {
+            Some(Tab::Console(c)) => Some(c.source.clone()),
+            _ => None,
+        };
+        if active_source.is_some() {
+            self.load_all_tables();
+        }
+        let catalog_tables = active_source.as_deref().map(|s| self.source_tables(s)).unwrap_or_default();
+        let default_schema = match active_source.as_deref().and_then(|s| self.source(s)).map(|s| s.kind.dialect()) {
+            Some(dbm_core::Dialect::Sqlite) => "main",
+            _ => "public",
+        };
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tabs.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -857,7 +900,9 @@ impl eframe::App for App {
                     let fks = self.fk_cache.get(&c.source).unwrap_or(&no_fks);
                     let tables = self.table_cache.get(&c.source).unwrap_or(&no_tables);
                     let incoming = self.incoming_cache.get(&c.source).unwrap_or(&no_incoming);
-                    if let Some(a) = c.show(ui, history, fks, tables, incoming) {
+                    let catalog =
+                        crate::ui::completion::Catalog { tables: &catalog_tables, details: tables, default_schema };
+                    if let Some(a) = c.show(ui, history, fks, tables, incoming, &catalog) {
                         console_actions.push((c.id, a));
                     }
                 }
@@ -866,6 +911,21 @@ impl eframe::App for App {
         });
         if close_active {
             self.request_close_tab(self.active_tab);
+        }
+        let wanted: Vec<(String, u64, String, String)> = self
+            .tabs
+            .iter_mut()
+            .filter_map(|t| match t {
+                Tab::Console(c) => Some(c),
+                _ => None,
+            })
+            .flat_map(|c| {
+                let (source, id) = (c.source.clone(), c.id);
+                std::mem::take(&mut c.wanted_details).into_iter().map(move |(s, t)| (source.clone(), id, s, t))
+            })
+            .collect();
+        for (source, console, schema, table) in wanted {
+            self.request_details(&source, console, schema, table);
         }
         for (console, action) in console_actions {
             match action {
