@@ -235,3 +235,35 @@ pub fn json_layout(ui: &egui::Ui, text: &str, wrap_width: f32) -> LayoutJob {
     }
     job
 }
+
+/// Paints a background behind the byte `ranges` of the job's text, the
+/// `current` one stronger: find matches in the editor.
+pub fn mark(job: &mut LayoutJob, ranges: &[std::ops::Range<usize>], current: Option<usize>) {
+    if ranges.is_empty() {
+        return;
+    }
+    let match_bg = Color32::from_rgb(255, 236, 160);
+    let current_bg = Color32::from_rgb(255, 196, 80);
+    let mut sections = Vec::with_capacity(job.sections.len() + ranges.len() * 2);
+    for section in std::mem::take(&mut job.sections) {
+        let mut at: usize = section.byte_range.start.into();
+        let end: usize = section.byte_range.end.into();
+        while at < end {
+            // The next boundary: a range start or end inside this section.
+            let hit = ranges.iter().enumerate().find(|(_, r)| r.end > at && r.start < end);
+            let (next, background) = match hit {
+                Some((_, r)) if r.start > at => (r.start.min(end), None),
+                Some((i, r)) => (r.end.min(end), Some(if Some(i) == current { current_bg } else { match_bg })),
+                None => (end, None),
+            };
+            let mut s = section.clone();
+            s.byte_range = at.into()..next.into();
+            if let Some(bg) = background {
+                s.format.background = bg;
+            }
+            sections.push(s);
+            at = next;
+        }
+    }
+    job.sections = sections;
+}

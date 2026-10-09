@@ -16,8 +16,8 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, St
 use crate::ui::completion::{self, Catalog, Item};
 use crate::ui::edits::{self, EditStatement, EditTarget, Edits, RowRef};
 use crate::ui::grid::{self, ColumnMeta, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
-use crate::ui::sql_highlight;
 use crate::ui::theme::{self, color, icon};
+use crate::ui::{sql_format, sql_highlight};
 
 pub const PAGE_SIZE: usize = 500;
 
@@ -27,6 +27,9 @@ const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S)
 const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 pub const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
 pub const OPEN_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
+const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const COMMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash);
+const FORMAT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::L);
 
 /// SQL plus its bound parameters.
 pub type Statement = (String, Vec<Value>);
@@ -182,6 +185,20 @@ pub struct CompletionPopup {
     anchor: egui::Pos2,
 }
 
+/// The editor's find / replace bar.
+#[derive(Default)]
+struct FindBar {
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+    /// Index of the current match.
+    current: usize,
+    /// Focus the query field next frame.
+    focus: bool,
+    /// Scroll the editor to the current match and select it.
+    reveal: bool,
+}
+
 /// Field buffers of the row panel, for the row they were filled from.
 struct RowPanel {
     tab: usize,
@@ -222,6 +239,7 @@ pub struct Console {
     pub saved_text: Option<String>,
     /// Cmd+S this frame: saves grid edits if there are any, else the file.
     save_requested: bool,
+    find: Option<FindBar>,
     editor_collapsed: bool,
     panel_open: bool,
     panel: Option<RowPanel>,
@@ -289,6 +307,7 @@ impl Console {
             file: None,
             saved_text: None,
             save_requested: false,
+            find: None,
             editor_collapsed: false,
             panel_open: true,
             panel: None,
@@ -420,6 +439,24 @@ impl Console {
         } else {
             (false, false)
         };
+        if ui.input_mut(|i| i.consume_shortcut(&FIND)) {
+            self.open_find(ui, editor_id);
+        }
+        if editor_focused {
+            let (comment, format) = ui.input_mut(|i| (i.consume_shortcut(&COMMENT), i.consume_shortcut(&FORMAT)));
+            if comment {
+                self.toggle_comment(ui, editor_id);
+            }
+            if format {
+                self.format_sql(ui, editor_id);
+            }
+        }
+        let matches =
+            self.find.as_ref().map(|f| sql_format::find_all(&self.sql, &f.query, f.case_sensitive)).unwrap_or_default();
+        if let Some(f) = &mut self.find {
+            f.current = f.current.min(matches.len().saturating_sub(1));
+        }
+        let current_match = self.find.as_ref().filter(|_| !matches.is_empty()).map(|f| f.current);
         let mut editor_out = None;
         let mut marker_run = None;
 
@@ -476,6 +513,28 @@ impl Console {
                             ui.label(RichText::new(path.display().to_string()).small().color(color::TEXT_WEAK));
                         }
                     });
+                    ui.menu_button(format!("{}  Edit", icon::PENCIL_SIMPLE), |ui| {
+                        let ctx = ui.ctx().clone();
+                        if ui
+                            .add(egui::Button::new("Find / Replace").shortcut_text(ctx.format_shortcut(&FIND)))
+                            .clicked()
+                        {
+                            self.open_find(ui, editor_id);
+                            ui.close();
+                        }
+                        if ui
+                            .add(egui::Button::new("Toggle comment").shortcut_text(ctx.format_shortcut(&COMMENT)))
+                            .clicked()
+                        {
+                            self.toggle_comment(ui, editor_id);
+                            ui.close();
+                        }
+                        if ui.add(egui::Button::new("Format SQL").shortcut_text(ctx.format_shortcut(&FORMAT))).clicked()
+                        {
+                            self.format_sql(ui, editor_id);
+                            ui.close();
+                        }
+                    });
                     ui.menu_button(format!("{}  History", icon::CLOCK_COUNTER_CLOCKWISE), |ui| {
                         if cx.history.is_empty() {
                             ui.weak("No queries yet");
@@ -501,8 +560,17 @@ impl Console {
                 return;
             }
             ui.add_space(6.0);
+            if self.find.is_some() {
+                self.find_bar(ui, editor_id, &matches);
+                ui.add_space(4.0);
+            }
+            let self_len = self.sql.len();
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                let job = sql_highlight::layout(ui, text.as_str(), wrap_width);
+                let mut job = sql_highlight::layout(ui, text.as_str(), wrap_width);
+                // Ranges are only valid for the text they were found in.
+                if text.as_str().len() == self_len {
+                    sql_highlight::mark(&mut job, &matches, current_match);
+                }
                 ui.fonts_mut(|f| f.layout_job(job))
             };
             egui::ScrollArea::vertical().id_salt(("editor-scroll", self.id)).auto_shrink([false, false]).show(
@@ -527,6 +595,22 @@ impl Console {
                             .layouter(&mut layouter)
                             .show(ui);
                         let cursor = output.cursor_range.map(|r| r.primary.index.0);
+                        if let Some(f) = &mut self.find
+                            && std::mem::take(&mut f.reveal)
+                            && let Some(m) = current_match.and_then(|i| matches.get(i))
+                        {
+                            let (a, b) = (self.sql[..m.start].chars().count(), self.sql[..m.end].chars().count());
+                            let rect = output.galley.pos_from_cursor(egui::text::CCursor::new(a));
+                            ui.scroll_to_rect(rect.translate(output.galley_pos.to_vec2()), Some(egui::Align::Center));
+                            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), editor_id) {
+                                let range = egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(a),
+                                    egui::text::CCursor::new(b),
+                                );
+                                state.cursor.set_char_range(Some(range));
+                                state.store(ui.ctx(), editor_id);
+                            }
+                        }
                         marker_run = self.paint_gutter(ui, gutter, &output.galley, output.galley_pos, cursor);
                         editor_out = Some((
                             output.response.response.changed(),
@@ -736,6 +820,191 @@ impl Console {
         }
         ui.memory_mut(|m| m.request_focus(editor_id));
         self.completion_waiting = false;
+    }
+
+    /// The editor's selection as byte offsets (start, end), if it has a cursor.
+    fn editor_selection(&self, ctx: &egui::Context, editor_id: egui::Id) -> Option<(usize, usize)> {
+        let r = egui::TextEdit::load_state(ctx, editor_id)?.cursor.char_range()?;
+        let (a, b) = (r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0));
+        let to_byte = |c: usize| self.sql.char_indices().nth(c).map_or(self.sql.len(), |(b, _)| b);
+        Some((to_byte(a), to_byte(b)))
+    }
+
+    /// Selects the byte range `range` of the editor text and focuses it.
+    fn select_in_editor(&self, ctx: &egui::Context, editor_id: egui::Id, range: std::ops::Range<usize>) {
+        let (a, b) = (self.sql[..range.start].chars().count(), self.sql[..range.end].chars().count());
+        let mut state = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
+        let range = egui::text::CCursorRange::two(egui::text::CCursor::new(a), egui::text::CCursor::new(b));
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, editor_id);
+        ctx.memory_mut(|m| m.request_focus(editor_id));
+    }
+
+    fn open_find(&mut self, ui: &egui::Ui, editor_id: egui::Id) {
+        // A single-line selection becomes the search text.
+        let selected = self
+            .editor_selection(ui.ctx(), editor_id)
+            .filter(|(a, b)| a < b)
+            .map(|(a, b)| self.sql[a..b].to_string())
+            .filter(|t| !t.contains('\n'));
+        let find = self.find.get_or_insert_with(FindBar::default);
+        if let Some(text) = selected {
+            find.query = text;
+            find.current = 0;
+        }
+        find.focus = true;
+        self.editor_collapsed = false;
+    }
+
+    fn find_bar(&mut self, ui: &mut egui::Ui, editor_id: egui::Id, matches: &[std::ops::Range<usize>]) {
+        let Some(find) = &mut self.find else { return };
+        let count = matches.len();
+        let (mut next, mut prev, mut replace_one, mut replace_all, mut close) = (false, false, false, false, false);
+        egui::Frame::new()
+            .fill(color::BG_SUBTLE)
+            .stroke(Stroke::new(1.0, color::BORDER))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut find.query)
+                            .font(theme::mono(12.5))
+                            .hint_text(format!("{}  Find", icon::MAGNIFYING_GLASS))
+                            .desired_width(220.0),
+                    );
+                    if std::mem::take(&mut find.focus) {
+                        r.request_focus();
+                    }
+                    if r.changed() {
+                        find.current = 0;
+                        find.reveal = true;
+                    }
+                    let (enter, shift, escape) =
+                        ui.input(|i| (i.key_pressed(Key::Enter), i.modifiers.shift, i.key_pressed(Key::Escape)));
+                    if r.lost_focus() && enter {
+                        if shift {
+                            prev = true
+                        } else {
+                            next = true
+                        }
+                        r.request_focus();
+                    }
+                    if (r.has_focus() || r.lost_focus()) && escape {
+                        close = true;
+                    }
+                    let case = RichText::new("Aa").color(if find.case_sensitive {
+                        color::ACCENT_TEXT
+                    } else {
+                        color::TEXT_WEAK
+                    });
+                    if ui.selectable_label(find.case_sensitive, case).on_hover_text("Match case").clicked() {
+                        find.case_sensitive = !find.case_sensitive;
+                        find.current = 0;
+                        find.reveal = true;
+                    }
+                    let label = match count {
+                        0 if find.query.is_empty() => String::new(),
+                        0 => "No results".into(),
+                        n => format!("{} of {n}", find.current + 1),
+                    };
+                    ui.label(RichText::new(label).small().color(color::TEXT_WEAK));
+                    if ui
+                        .add_enabled(count > 0, theme::flat_button(icon::ARROW_UP))
+                        .on_hover_text("Previous (Shift+Enter)")
+                        .clicked()
+                    {
+                        prev = true;
+                    }
+                    if ui
+                        .add_enabled(count > 0, theme::flat_button(icon::ARROW_DOWN))
+                        .on_hover_text("Next (Enter)")
+                        .clicked()
+                    {
+                        next = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(theme::flat_button(icon::X)).on_hover_text("Close (Esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut find.replacement)
+                            .font(theme::mono(12.5))
+                            .hint_text("Replace with")
+                            .desired_width(220.0),
+                    );
+                    if ui.add_enabled(count > 0, theme::flat_button("Replace")).clicked() {
+                        replace_one = true;
+                    }
+                    if ui.add_enabled(count > 0, theme::flat_button("Replace all")).clicked() {
+                        replace_all = true;
+                    }
+                });
+            });
+        if count > 0 {
+            if next {
+                find.current = (find.current + 1) % count;
+                find.reveal = true;
+            }
+            if prev {
+                find.current = (find.current + count - 1) % count;
+                find.reveal = true;
+            }
+        }
+        let replacement = find.replacement.clone();
+        if replace_one && let Some(m) = matches.get(find.current) {
+            // The next match moves into the same index.
+            self.sql.replace_range(m.clone(), &replacement);
+            if let Some(f) = &mut self.find {
+                f.reveal = true;
+            }
+        }
+        if replace_all {
+            for m in matches.iter().rev() {
+                self.sql.replace_range(m.clone(), &replacement);
+            }
+        }
+        if close {
+            let current = self.find.take().and_then(|f| matches.get(f.current).cloned());
+            match current {
+                Some(m) if m.end <= self.sql.len() => self.select_in_editor(ui.ctx(), editor_id, m),
+                _ => ui.memory_mut(|m| m.request_focus(editor_id)),
+            }
+        }
+    }
+
+    /// Cmd+/: toggles `--` on the selected lines, or the cursor's line.
+    fn toggle_comment(&mut self, ui: &egui::Ui, editor_id: egui::Id) {
+        let (a, b) = self.editor_selection(ui.ctx(), editor_id).unwrap_or((self.sql.len(), self.sql.len()));
+        let (sql, lines) = sql_format::toggle_comment(&self.sql, a, b);
+        self.sql = sql;
+        if a == b {
+            // Keep a plain cursor at the end of its line.
+            self.select_in_editor(ui.ctx(), editor_id, lines.end..lines.end);
+        } else {
+            self.select_in_editor(ui.ctx(), editor_id, lines);
+        }
+    }
+
+    /// Formats the selection, or the statement under the cursor.
+    fn format_sql(&mut self, ui: &egui::Ui, editor_id: egui::Id) {
+        let range = match self.editor_selection(ui.ctx(), editor_id) {
+            Some((a, b)) if a < b => a..b,
+            Some((a, _)) => match statement_at(&self.sql, a, self.dialect) {
+                Some(r) => r,
+                None => return,
+            },
+            None => return,
+        };
+        let formatted = sql_format::format(&self.sql[range.clone()]);
+        if formatted == self.sql[range.clone()] {
+            return;
+        }
+        self.sql.replace_range(range.clone(), &formatted);
+        self.select_in_editor(ui.ctx(), editor_id, range.start..range.start + formatted.len());
     }
 
     fn run_all(&self) -> Option<ConsoleAction> {
