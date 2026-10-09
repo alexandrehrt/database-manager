@@ -98,6 +98,8 @@ pub struct App {
     restore_pending: HashSet<u64>,
     last_session: persist::Session,
     last_session_save: Instant,
+    /// Consoles that ran DDL inside a transaction; the explorer refreshes once it ends.
+    ddl_uncommitted: HashSet<u64>,
 }
 
 impl App {
@@ -137,6 +139,7 @@ impl App {
             restore_pending: HashSet::new(),
             last_session: persist::Session::default(),
             last_session_save: Instant::now(),
+            ddl_uncommitted: HashSet::new(),
         };
         app.restore_session();
         app
@@ -462,6 +465,35 @@ impl App {
         }
     }
 
+    /// Reloads the explorer and drops cached table metadata after a schema change,
+    /// keeping what is shown until the new lists arrive.
+    fn refresh_after_ddl(&mut self, source: &str) {
+        self.fk_cache.remove(source);
+        self.table_cache.remove(source);
+        self.incoming_cache.remove(source);
+        self.fk_pending.retain(|(s, _, _)| s != source);
+        let open: Vec<(u64, String, String)> = self
+            .tabs
+            .iter()
+            .filter(|c| c.source == source)
+            .filter_map(|c| c.table.as_ref().map(|t| (c.id, t.schema.clone(), t.table.clone())))
+            .collect();
+        for (id, schema, table) in open {
+            self.request_details(source, id, schema, table);
+        }
+        let mut loaded = Vec::new();
+        if let Loadable::Loaded(schemas) = &self.tree(source).schemas {
+            loaded
+                .extend(schemas.iter().filter(|s| matches!(s.relations, Loadable::Loaded(_))).map(|s| s.name.clone()));
+        } else {
+            return;
+        }
+        self.apply(Action::LoadSchemas(source.to_string()));
+        for schema in loaded {
+            self.apply(Action::LoadRelations(source.to_string(), schema));
+        }
+    }
+
     /// Requests whatever schemas and relations of connected sources aren't
     /// loaded yet, so the Go to table picker and completion can search them.
     /// Returns whether anything is still loading.
@@ -628,6 +660,13 @@ impl App {
                 }
             }
             Event::ControlDone { console, sql, result, in_transaction } => {
+                if !in_transaction
+                    && self.ddl_uncommitted.remove(&console)
+                    && sql == "COMMIT"
+                    && let Some(source) = self.console_mut(console).map(|c| c.source.clone())
+                {
+                    self.refresh_after_ddl(&source);
+                }
                 if let Some(c) = self.console_mut(console) {
                     c.tx_busy = false;
                     c.in_transaction = in_transaction;
@@ -643,6 +682,7 @@ impl App {
                     Ok(ExecOutcome::Rows(rs)) => Some(rs.clone()),
                     _ => None,
                 };
+                let ddl = result.outcome.is_ok() && is_ddl(&result.sql);
                 let mut source = None;
                 if let Some(c) = self.console_mut(console)
                     && let Some(r) = &mut c.run
@@ -698,6 +738,16 @@ impl App {
                     }
                     source = Some(c.source.clone());
                 }
+                if let Some(source) = &source {
+                    if ddl {
+                        self.ddl_uncommitted.insert(console);
+                    }
+                    // Outside a transaction the change is visible now (COMMIT typed in
+                    // the console also lands here).
+                    if !in_transaction && self.ddl_uncommitted.remove(&console) {
+                        self.refresh_after_ddl(source);
+                    }
+                }
                 if let Some(source) = source {
                     self.remember(&source, &result.sql);
                     if let Some(rs) = rows {
@@ -732,9 +782,21 @@ impl App {
                 }
             }
             Event::Schemas { source, result } => {
+                // A reload keeps the relations already listed until their own reload lands.
+                let mut previous: HashMap<String, Loadable<Vec<dbm_core::Relation>>> =
+                    match std::mem::replace(&mut self.tree(&source).schemas, Loadable::NotLoaded) {
+                        Loadable::Loaded(nodes) => nodes.into_iter().map(|n| (n.name, n.relations)).collect(),
+                        _ => HashMap::new(),
+                    };
                 self.tree(&source).schemas = match result {
                     Ok(names) => Loadable::Loaded(
-                        names.into_iter().map(|name| SchemaNode { name, relations: Loadable::NotLoaded }).collect(),
+                        names
+                            .into_iter()
+                            .map(|name| {
+                                let relations = previous.remove(&name).unwrap_or(Loadable::NotLoaded);
+                                SchemaNode { name, relations }
+                            })
+                            .collect(),
                     ),
                     Err(e) => Loadable::Failed(e.to_string()),
                 };
@@ -1482,4 +1544,20 @@ fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(
             }
         });
     });
+}
+
+/// Whether a statement changes the schema (CREATE, ALTER, DROP, …).
+fn is_ddl(sql: &str) -> bool {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.split_once('\n').map_or("", |(_, r)| r).trim_start();
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map_or("", |(_, r)| r).trim_start();
+        } else {
+            break;
+        }
+    }
+    let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().to_ascii_uppercase();
+    matches!(word.as_str(), "CREATE" | "ALTER" | "DROP" | "RENAME" | "COMMENT")
 }
