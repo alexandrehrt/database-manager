@@ -159,8 +159,12 @@ impl Worker {
 
     pub fn test(&self, nonce: u64, config: DataSourceConfig, password: Option<String>) {
         self.spawn(async move {
+            let started = std::time::Instant::now();
             let result = match open(&config, password).await {
-                Ok(conn) => conn.schemas().await.map(|s| format!("Connected. {} schema(s) visible.", s.len())),
+                Ok(conn) => {
+                    let ms = started.elapsed().as_millis();
+                    Ok(format!("{} · {ms} ms", server_version(conn.as_ref()).await))
+                }
                 Err(e) => Err(e),
             };
             Event::Tested { nonce, result }
@@ -303,6 +307,24 @@ async fn apply_edits(
         conn.execute("COMMIT", &[], None).await.map_err(|e| format!("COMMIT failed: {}", e.message))?;
     }
     Ok(())
+}
+
+/// "PostgreSQL 16.4", "SQLite 3.46.0", "Oracle 23.5.0.24.07"; the engine name alone if unknown.
+async fn server_version(conn: &dyn Connection) -> String {
+    let (engine, sql) = match conn.dialect() {
+        dbm_core::Dialect::Postgres => ("PostgreSQL", "SHOW server_version"),
+        dbm_core::Dialect::Sqlite => ("SQLite", "SELECT sqlite_version()"),
+        dbm_core::Dialect::Oracle => ("Oracle", "SELECT version_full FROM product_component_version WHERE ROWNUM = 1"),
+    };
+    let version = match conn.execute(sql, &[], Some(1)).await {
+        Ok(dbm_core::ExecOutcome::Rows(rs)) => rs.rows.first().and_then(|r| r.first()).map(|v| v.to_string()),
+        _ => None,
+    };
+    // Postgres appends the build (e.g. "16.4 (Debian 16.4-1)").
+    match version.as_deref().and_then(|v| v.split_whitespace().next()) {
+        Some(v) => format!("{engine} {v}"),
+        None => engine.to_string(),
+    }
 }
 
 /// The given password, else the one saved in the keychain.

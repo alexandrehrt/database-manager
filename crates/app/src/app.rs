@@ -701,7 +701,7 @@ impl App {
                 }
                 self.worker.test(nonce, config, password);
             }
-            DialogAction::Save { config, password, save_password } => {
+            DialogAction::Save { config, password, save_password, connect } => {
                 if let Some(pw) = password {
                     if save_password {
                         if let Err(e) = persist::save_password(&config.id, &pw) {
@@ -724,8 +724,11 @@ impl App {
                 self.persist_sources();
                 // Settings may have changed, so the next use reconnects.
                 self.disconnect_source(&id);
-                self.current_source = Some(id);
+                self.current_source = Some(id.clone());
                 self.dialog = None;
+                if connect {
+                    self.apply(Action::Connect(id));
+                }
             }
             DialogAction::Delete(id) => {
                 self.sources.retain(|s| s.id != id);
