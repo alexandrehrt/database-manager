@@ -29,9 +29,12 @@ Then use **File → New data source…** to add them. For the SQLite database, p
 
 ## Using it
 
+The window follows a fixed layout. The top bar holds the data source picker, the schema breadcrumb, a **Content / Structure / SQL** switch for table tabs, **Go to table** (Cmd+K) and the **Auto-commit** menu. The sidebar lists the current source's tables and views, then your connections. Tabs run across the top of the main area.
+
+
 - **Explorer:** expand a data source to connect. Schemas, tables, columns, keys and indexes load as you expand them. Columns show PK/FK badges, and hovering an FK shows its target.
 - **Consoles:** double-click a data source, or right-click it → New console. **Cmd+Enter** runs the statement under the cursor, or the selection. **Cmd+Shift+Enter** runs the whole script. Each statement gets its own results tab, and execution stops at the first error.
-- **Table data:** double-click a table, or press **Cmd+O** and type part of its name. A WHERE / ORDER BY bar sits above the data, and clicking a column header sorts on the server. Right-click a table → **Show DDL** for its definition.
+- **Table data:** click a table in the sidebar, or press **Cmd+K** and type part of its name. Filters and the sort order appear as chips above the data: **+ Filter** adds a condition, and clicking a column header sorts on the server. **Structure** shows the table's columns, indexes and keys, and **SQL** shows its DDL. Right-click a table → **Show DDL** for its definition.
 - **Explorer filter:** type in the box at the top of the explorer to show only matching tables.
 - **Autocomplete:** suggestions appear as you type, or with **Ctrl+Space**. After `alias.` you get that table's columns.
 - **Transactions:** each console has its own connection. Switch `Tx:` to **Manual** to keep a transaction open until you press **Commit** or **Rollback**. A yellow badge shows when one is open.
@@ -40,7 +43,8 @@ Then use **File → New data source…** to add them. For the SQLite database, p
   - Right-click a cell to copy its value.
   - **Load more** fetches the next 500 rows.
   - Results can be exported to CSV or JSON.
-- **Editing data:** when a result comes from one table and includes its primary key, double-click a cell to edit it. Right-click a cell for NULL, revert or delete. **+ Row** adds a row. Changes are tinted until you press **Submit**, which applies them all or none.
+- **Row panel:** selecting a row opens it on the right, with a field per column and a **Referenced by** list.
+- **Editing data:** when a result comes from one table and includes its primary key, double-click a cell or use the row panel to edit it. Right-click a cell for NULL, revert or delete. **+ Row** adds a row. Changes are tinted until you press **Save** (Cmd+S) in the bottom bar, which applies them all or none. **View SQL** shows the statements first.
 - **Copying rows:** click, Shift+click or Cmd+click to select rows. Cmd+C copies them as TSV for spreadsheets. Right-click → Copy rows as CSV, JSON, Markdown or INSERT statements.
 - **Foreign-key navigation:** a value in a foreign-key column is a link. Clicking it opens the referenced row in a new results tab. Back/Forward and the breadcrumb take you along the path. Navigation works for any query whose columns come straight from a table, not just for "open table". Right-click a row → **Referencing rows** goes the other way, to the rows that point at it.
 - **History:** the console's History menu lists earlier statements for that data source.
@@ -52,7 +56,8 @@ Then use **File → New data source…** to add them. For the SQLite database, p
 | Cmd+N | New data source |
 | Cmd+T | New console |
 | Cmd+W | Close tab |
-| Cmd+O | Go to table |
+| Cmd+K (or Cmd+O) | Go to table |
+| Cmd+S | Save pending grid edits |
 | Ctrl+Space | Show completions |
 | Cmd+A / Cmd+C (grid) | Select all rows / copy selected rows |
 
@@ -72,3 +77,7 @@ Then use **File → New data source…** to add them. For the SQLite database, p
 | `crates/app` | The egui application |
 
 There is no automated test suite yet. Each change was checked by building it, running clippy and doing a walkthrough against the sample databases. The pull requests record those walkthroughs.
+
+## Fonts and icons
+
+The interface bundles [Inter](https://rsms.me/inter/) and [JetBrains Mono](https://www.jetbrains.com/lp/mono/), both under the SIL Open Font License (licences in `crates/app/assets/fonts`). Both are subset to drop their private-use glyphs, which would otherwise hide the [Phosphor](https://phosphoricons.com/) icons that share that Unicode range.
