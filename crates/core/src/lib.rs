@@ -3,6 +3,7 @@
 pub mod config;
 pub mod ddl;
 pub mod dialect;
+pub mod dml;
 pub mod driver;
 pub mod export;
 pub mod fk_nav;

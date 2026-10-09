@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 use dbm_core::driver::is_read_only_query;
 use dbm_core::fk_nav::{FkLink, ForeignKeyIndex, link_for_cell};
 use dbm_core::statement_at::statement_at;
-use dbm_core::{DbError, Dialect, ExecOutcome, Value, sql_split};
+use std::collections::HashMap;
+
+use dbm_core::{DbError, Dialect, ExecOutcome, TableDetails, Value, sql_split};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
-use crate::ui::grid::{self, SortState};
+use crate::ui::edits::{self, EditStatement, Edits};
+use crate::ui::grid::{self, EditingCell, GridEdit, SortState};
 use crate::ui::sql_highlight;
 
 pub const PAGE_SIZE: usize = 500;
@@ -32,6 +35,30 @@ pub struct ResultTab {
     /// Row limit the statement ran with; "load more" re-runs it with a larger one.
     pub limit: usize,
     pub sort: SortState,
+    pub edits: Edits,
+    pub editing: Option<EditingCell>,
+    /// A submit is in flight.
+    pub submitting: bool,
+    /// Why the last submit failed.
+    pub edit_error: Option<String>,
+}
+
+impl ResultTab {
+    pub fn new(title: Option<String>, sql: String, params: Vec<Value>, outcome: Result<ExecOutcome, DbError>) -> Self {
+        Self {
+            title,
+            sql,
+            params,
+            outcome,
+            elapsed: Duration::default(),
+            limit: PAGE_SIZE,
+            sort: SortState::default(),
+            edits: Edits::default(),
+            editing: None,
+            submitting: false,
+            edit_error: None,
+        }
+    }
 }
 
 pub struct Run {
@@ -42,6 +69,8 @@ pub struct Run {
     pub done: usize,
     pub mode: RunMode,
     pub params: Vec<Vec<Value>>,
+    /// Row limit of this run, kept by the tab it fills.
+    pub limit: usize,
 }
 
 #[derive(Clone)]
@@ -84,10 +113,19 @@ pub struct Console {
 }
 
 pub enum ConsoleAction {
-    Run { statements: Vec<Statement>, limit: usize, mode: RunMode },
+    Run {
+        statements: Vec<Statement>,
+        limit: usize,
+        mode: RunMode,
+    },
     Cancel,
     Commit,
     Rollback,
+    /// Apply the pending edits of result tab `tab`.
+    SubmitEdits {
+        tab: usize,
+        statements: Vec<EditStatement>,
+    },
 }
 
 impl Console {
@@ -112,7 +150,13 @@ impl Console {
 
     /// `fks` holds foreign keys of the tables results came from, as far as
     /// they are loaded; cells covered by one become navigation links.
-    pub fn show(&mut self, ui: &mut egui::Ui, history: &[String], fks: &ForeignKeyIndex) -> Option<ConsoleAction> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        history: &[String],
+        fks: &ForeignKeyIndex,
+        tables: &HashMap<(String, String), TableDetails>,
+    ) -> Option<ConsoleAction> {
         let mut action = None;
         let editor_id = egui::Id::new(("console-editor", self.id));
         let editor_focused = ui.memory(|m| m.has_focus(editor_id));
@@ -212,7 +256,7 @@ impl Console {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(a) = self.results_ui(ui, fks) {
+            if let Some(a) = self.results_ui(ui, fks, tables) {
                 action = Some(a);
             }
         });
@@ -326,7 +370,12 @@ impl Console {
         self.results[i].title.clone().unwrap_or_else(|| format!("Result {}", i + 1))
     }
 
-    fn results_ui(&mut self, ui: &mut egui::Ui, fks: &ForeignKeyIndex) -> Option<ConsoleAction> {
+    fn results_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        fks: &ForeignKeyIndex,
+        tables: &HashMap<(String, String), TableDetails>,
+    ) -> Option<ConsoleAction> {
         if self.results.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.weak(if self.run.is_some() { "Running…" } else { "Results appear here." });
@@ -393,7 +442,12 @@ impl Console {
         let idx = self.active_result.min(self.results.len() - 1);
         let console_id = self.id;
         let running = self.run.is_some();
+        let dialect = self.dialect;
         let tab = &mut self.results[idx];
+        let target = match &tab.outcome {
+            Ok(ExecOutcome::Rows(rs)) => Some(edits::edit_target(rs, tables)),
+            _ => None,
+        };
 
         ui.horizontal(|ui| match &tab.outcome {
             Ok(ExecOutcome::Rows(rs)) => {
@@ -412,6 +466,40 @@ impl Console {
                     ui.weak("(more rows not fetched)");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match &target {
+                        Some(Ok(t)) => {
+                            let pending = tab.edits.row_count();
+                            let idle = !running && !tab.submitting;
+                            if ui
+                                .add_enabled(idle && pending > 0, egui::Button::new(format!("Submit ({pending})")))
+                                .on_hover_text("Write the changes to the database")
+                                .clicked()
+                            {
+                                action = Some(ConsoleAction::SubmitEdits {
+                                    tab: idx,
+                                    statements: edits::statements(dialect, t, rs, &tab.edits),
+                                });
+                            }
+                            if ui.add_enabled(idle && pending > 0, egui::Button::new("Revert all")).clicked() {
+                                tab.edits = Edits::default();
+                                tab.editing = None;
+                                tab.edit_error = None;
+                            }
+                            if ui.add_enabled(idle, egui::Button::new("+ Row")).clicked() {
+                                tab.edits.inserts.push(vec![None; rs.columns.len()]);
+                            }
+                            if tab.submitting {
+                                ui.spinner();
+                            }
+                            ui.weak(format!("editable: {}", t.table))
+                                .on_hover_text("Double-click a cell to edit; right-click for NULL, revert and delete");
+                        }
+                        Some(Err(reason)) => {
+                            ui.weak("read-only").on_hover_text(reason);
+                        }
+                        None => {}
+                    }
+                    ui.separator();
                     if ui.button("Export JSON").clicked() {
                         export(rs, "json");
                     }
@@ -436,10 +524,15 @@ impl Console {
                 });
             }
         });
+        if let Some(error) = &tab.edit_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
         ui.separator();
         if let Ok(ExecOutcome::Rows(rs)) = &tab.outcome {
             let is_link = |row: usize, col: usize| link_for_cell(&rs.columns, &rs.rows[row], col, fks).is_some();
-            if let Some((row, col)) = grid::show(ui, (console_id, idx), rs, &mut tab.sort, &is_link)
+            let edit =
+                matches!(target, Some(Ok(_))).then(|| GridEdit { edits: &mut tab.edits, editing: &mut tab.editing });
+            if let Some((row, col)) = grid::show(ui, (console_id, idx), rs, &mut tab.sort, &is_link, edit)
                 && !running
                 && let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks)
             {
