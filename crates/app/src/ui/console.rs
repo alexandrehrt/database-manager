@@ -83,6 +83,9 @@ pub enum RunMode {
     Replace(usize),
     /// FK navigation from tab `from`: add a tab and make it current.
     Navigate { from: usize, title: String },
+    /// Re-query table data with a new filter/sort: replaces the first tab on
+    /// success, keeps it and reports the error on failure.
+    Filter,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,6 +94,37 @@ pub enum TxMode {
     Auto,
     /// The first statement opens a transaction that stays open until Commit or Rollback.
     Manual,
+}
+
+/// Filter and sort applied server-side to a console opened on a table's data.
+pub struct TableView {
+    pub schema: String,
+    pub table: String,
+    pub filter: String,
+    pub order: String,
+    /// Column sorted by a header click and its direction; `None` once the
+    /// ORDER BY text is edited by hand.
+    pub sort: Option<(usize, bool)>,
+    /// Error of the last filter run; the previous rows stay visible.
+    pub error: Option<String>,
+}
+
+impl TableView {
+    pub fn new(schema: String, table: String, filter: String, order: String) -> Self {
+        Self { schema, table, filter, order, sort: None, error: None }
+    }
+
+    /// Clauses go on their own lines so a `--` comment in one can't swallow the next.
+    pub fn sql(&self, dialect: Dialect) -> String {
+        let mut sql = dialect.select_all(&self.schema, &self.table);
+        if !self.filter.trim().is_empty() {
+            sql.push_str(&format!("\nWHERE {}", self.filter.trim()));
+        }
+        if !self.order.trim().is_empty() {
+            sql.push_str(&format!("\nORDER BY {}", self.order.trim()));
+        }
+        sql
+    }
 }
 
 pub struct Console {
@@ -112,6 +146,8 @@ pub struct Console {
     pub tx_busy: bool,
     /// Outcome of the last Commit / Rollback, shown in the toolbar.
     pub tx_notice: Option<Result<String, String>>,
+    /// Set for consoles opened on a table's data.
+    pub table: Option<TableView>,
 }
 
 pub enum ConsoleAction {
@@ -147,6 +183,7 @@ impl Console {
             in_transaction: false,
             tx_busy: false,
             tx_notice: None,
+            table: None,
         }
     }
 
@@ -369,6 +406,70 @@ impl Console {
         self.active_result = self.active_result.min(self.results.len().saturating_sub(1));
     }
 
+    /// WHERE / ORDER BY fields above table data. Enter in either field applies.
+    fn filter_bar(&mut self, ui: &mut egui::Ui) -> Option<ConsoleAction> {
+        let dialect = self.dialect;
+        let running = self.run.is_some();
+        let tv = self.table.as_mut()?;
+        let mut apply = false;
+        ui.horizontal(|ui| {
+            ui.label("WHERE");
+            let w = ui.add(
+                egui::TextEdit::singleline(&mut tv.filter)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("e.g. vip = true")
+                    .desired_width(ui.available_width() * 0.55),
+            );
+            ui.label("ORDER BY");
+            let o = ui.add(
+                egui::TextEdit::singleline(&mut tv.order)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("e.g. created_at DESC")
+                    .desired_width(ui.available_width() - 130.0),
+            );
+            if o.changed() {
+                tv.sort = None;
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            apply |= (w.lost_focus() || o.lost_focus()) && enter;
+            apply |= ui.add_enabled(!running, egui::Button::new("Apply")).clicked();
+            if ui.add_enabled(!running, egui::Button::new("Clear")).clicked() {
+                tv.filter.clear();
+                tv.order.clear();
+                tv.sort = None;
+                apply = true;
+            }
+        });
+        if let Some(e) = &tv.error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.separator();
+        if !apply || running {
+            return None;
+        }
+        let sql = tv.sql(dialect);
+        self.sql = sql.clone();
+        Some(ConsoleAction::Run { statements: vec![(sql, Vec::new())], limit: PAGE_SIZE, mode: RunMode::Filter })
+    }
+
+    /// Header click on table data: ascending, then descending, then unsorted.
+    fn sort_table_by(&mut self, col: usize, name: &str) -> Option<ConsoleAction> {
+        let dialect = self.dialect;
+        let tv = self.table.as_mut()?;
+        tv.sort = match tv.sort {
+            Some((c, true)) if c == col => Some((col, false)),
+            Some((c, false)) if c == col => None,
+            _ => Some((col, true)),
+        };
+        tv.order = match tv.sort {
+            Some((_, asc)) => format!("{} {}", dialect.quote_ident(name), if asc { "ASC" } else { "DESC" }),
+            None => String::new(),
+        };
+        let sql = tv.sql(dialect);
+        self.sql = sql.clone();
+        Some(ConsoleAction::Run { statements: vec![(sql, Vec::new())], limit: PAGE_SIZE, mode: RunMode::Filter })
+    }
+
     fn tab_label(&self, i: usize) -> String {
         self.results[i].title.clone().unwrap_or_else(|| format!("Result {}", i + 1))
     }
@@ -444,9 +545,15 @@ impl Console {
             ui.separator();
         }
         let idx = self.active_result.min(self.results.len() - 1);
+        if idx == 0
+            && let Some(a) = self.filter_bar(ui)
+        {
+            action = Some(a);
+        }
         let console_id = self.id;
         let running = self.run.is_some();
         let dialect = self.dialect;
+        let mut sort_request: Option<(usize, String)> = None;
         let tab = &mut self.results[idx];
         let target = match &tab.outcome {
             Ok(ExecOutcome::Rows(rs)) => Some(edits::edit_target(rs, tables)),
@@ -560,6 +667,7 @@ impl Console {
                 dialect,
                 table: table.as_deref(),
                 referencing: &referencing,
+                server_sort: self.table.as_ref().filter(|_| idx == 0).map(|tv| tv.sort),
             };
             match grid::show(ui, rs, &mut tab.sort, opts) {
                 Some(_) if running => {}
@@ -567,6 +675,10 @@ impl Console {
                     if let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks) {
                         action = Some(navigate(dialect, idx, &link));
                     }
+                }
+                Some(GridEvent::SortBy(col)) => {
+                    let name = rs.columns[col].name.clone();
+                    sort_request = Some((col, name));
                 }
                 Some(GridEvent::Referencing { row, key }) => {
                     if let Some(k) = keys.get(key)
@@ -579,6 +691,11 @@ impl Console {
             }
         } else {
             ui.add(egui::Label::new(RichText::new(&tab.sql).monospace().weak()).wrap());
+        }
+        if let Some((col, name)) = sort_request
+            && let Some(a) = self.sort_table_by(col, &name)
+        {
+            action = Some(a);
         }
         action
     }
