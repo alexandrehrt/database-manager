@@ -48,8 +48,17 @@ fn cell_text(v: &Value) -> String {
     s
 }
 
-pub fn show(ui: &mut egui::Ui, id: (u64, usize), rs: &ResultSet, sort: &mut SortState) {
+/// `is_link(row, col)` marks cells drawn as foreign-key links. Returns the
+/// (row, column) of a link clicked this frame, in data order.
+pub fn show(
+    ui: &mut egui::Ui,
+    id: (u64, usize),
+    rs: &ResultSet,
+    sort: &mut SortState,
+    is_link: &dyn Fn(usize, usize) -> bool,
+) -> Option<(usize, usize)> {
     sort.refresh(rs);
+    let mut clicked_link = None;
     let mut clicked_header = None;
     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
     let mono = egui::TextStyle::Monospace;
@@ -97,10 +106,16 @@ pub fn show(ui: &mut egui::Ui, id: (u64, usize), rs: &ResultSet, sort: &mut Sort
                     row.col(|ui| {
                         ui.weak((data_row + 1).to_string());
                     });
-                    for value in &rs.rows[data_row] {
+                    for (c, value) in rs.rows[data_row].iter().enumerate() {
                         row.col(|ui| {
                             let response = if value.is_null() {
                                 ui.label(RichText::new("NULL").italics().weak())
+                            } else if is_link(data_row, c) {
+                                let r = ui.link(RichText::new(cell_text(value)).text_style(mono.clone()));
+                                if r.clicked() {
+                                    clicked_link = Some((data_row, c));
+                                }
+                                r.on_hover_text("Open the referenced row")
                             } else {
                                 ui.add(egui::Label::new(RichText::new(cell_text(value)).text_style(mono.clone())).truncate())
                             };
@@ -118,4 +133,5 @@ pub fn show(ui: &mut egui::Ui, id: (u64, usize), rs: &ResultSet, sort: &mut Sort
     if let Some(col) = clicked_header {
         sort.toggle(col);
     }
+    clicked_link
 }

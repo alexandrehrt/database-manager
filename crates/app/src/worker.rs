@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use dbm_core::config::{DataSourceConfig, DataSourceKind};
-use dbm_core::{Connection, DbError, DbResult, Relation, StatementResult, TableDetails};
+use dbm_core::{Connection, DbError, DbResult, Relation, StatementResult, TableDetails, Value};
 use eframe::egui;
 
 use crate::persist;
@@ -97,18 +97,18 @@ impl Worker {
         conn: SharedConnection,
         console: u64,
         run: u64,
-        statements: Vec<String>,
+        statements: Vec<(String, Vec<Value>)>,
         max_rows: usize,
         stop: Arc<AtomicBool>,
     ) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
-            for (index, sql) in statements.into_iter().enumerate() {
+            for (index, (sql, params)) in statements.into_iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 let started = Instant::now();
-                let outcome = conn.execute(&sql, &[], Some(max_rows)).await;
+                let outcome = conn.execute(&sql, &params, Some(max_rows)).await;
                 let failed = outcome.is_err();
                 let result = StatementResult { sql, outcome, elapsed: started.elapsed() };
                 let _ = tx.send(Event::StatementDone { console, run, index, result });
