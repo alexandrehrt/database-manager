@@ -89,35 +89,42 @@ fn source_node(ui: &mut egui::Ui, source: &DataSourceConfig, tree: &mut SourceTr
         dbm_core::Dialect::Postgres => "pg",
         dbm_core::Dialect::Sqlite => "sqlite",
     };
-    let mut title = egui::text::LayoutJob::default();
     let dot = status_dot(&tree.status, ui);
-    title.append("● ", 0.0, egui::TextFormat { color: dot, ..Default::default() });
-    title.append(&source.name, 0.0, egui::TextFormat { color: ui.visuals().strong_text_color(), ..Default::default() });
-    let header = egui::CollapsingHeader::new(title)
-        .id_salt(("source", &id))
-        .show(ui, |ui| {
-            match &tree.status {
-                ConnStatus::Disconnected => {
-                    tree.status = ConnStatus::Connecting;
-                    actions.push(Action::Connect(id.clone()));
-                }
-                ConnStatus::Connecting => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak("Connecting…");
-                    });
-                }
-                ConnStatus::Failed(e) => {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                    if ui.small_button("Retry").clicked() {
-                        actions.push(Action::Connect(id.clone()));
-                    }
-                }
-                ConnStatus::Connected => schemas(ui, &id, &mut tree.schemas, actions),
-            }
+    let state_id = ui.make_persistent_id(("source", &id));
+    let header = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), state_id, false)
+        .show_header(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, dot);
+            ui.add(egui::Label::new(RichText::new(&source.name).strong()).sense(egui::Sense::click()).selectable(false))
         });
+    let (_, name_response, _) = header.body(|ui| match &tree.status {
+        ConnStatus::Disconnected => {
+            tree.status = ConnStatus::Connecting;
+            actions.push(Action::Connect(id.clone()));
+        }
+        ConnStatus::Connecting => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Connecting…");
+            });
+        }
+        ConnStatus::Failed(e) => {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+            if ui.small_button("Retry").clicked() {
+                actions.push(Action::Connect(id.clone()));
+            }
+        }
+        ConnStatus::Connected => schemas(ui, &id, &mut tree.schemas, actions),
+    });
+    let name_response = name_response.inner;
+    if name_response.clicked()
+        && let Some(mut state) = egui::collapsing_header::CollapsingState::load(ui.ctx(), state_id)
+    {
+        state.toggle(ui);
+        state.store(ui.ctx());
+    }
 
-    let header_response = header.header_response.on_hover_text(engine);
+    let header_response = name_response.on_hover_text(engine);
     header_response.context_menu(|ui| {
         if tree.status == ConnStatus::Connected {
             if ui.button("Refresh").clicked() {
