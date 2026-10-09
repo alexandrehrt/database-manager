@@ -1,6 +1,6 @@
 # DataGrip parity checklist
 
-What the app covers compared with DataGrip, as of v2, limited to PostgreSQL and SQLite. Status:
+What the app covers compared with DataGrip, as of v3, limited to PostgreSQL, SQLite and Oracle. Status:
 
 - **Done:** works, and was checked by hand against `fixtures/seed.sql`.
 - **Partial:** works, with the limitation noted.
@@ -17,7 +17,8 @@ What the app covers compared with DataGrip, as of v2, limited to PostgreSQL and 
 | SQLite file connection | Done | Creates the file if it doesn't exist. Foreign keys are enforced. |
 | Password storage | Done | Keychain, or session-only |
 | SSH tunnel, proxy, connection URL editing | Not yet | |
-| Other engines (MySQL, SQL Server, Oracle, …) | Not yet | Each would be another `Connection` implementation. |
+| Oracle connection | Partial | Needs Oracle Instant Client. FK links and grid editing only for simple single-table SELECTs, since Oracle doesn't report column origins. |
+| Other engines (MySQL, SQL Server, …) | Not yet | Each would be another `Connection` implementation. |
 
 ## Database explorer
 
@@ -28,7 +29,8 @@ What the app covers compared with DataGrip, as of v2, limited to PostgreSQL and 
 | Indexes, foreign keys | Done | |
 | Refresh, connect, disconnect | Done | |
 | Sequences, functions, triggers, roles | Not yet | SQLite triggers do appear in Show DDL. |
-| Search / filter in the tree | Done | Filter box narrows connected sources to matching tables and loads unloaded schemas; Cmd+O "Go to table" fuzzy picker opens a table's data. |
+| Search / filter in the tree | Done | Filter box narrows connected sources to matching tables and loads unloaded schemas; Cmd+K "Go to table" fuzzy picker opens a table's data. |
+| Refresh after DDL | Done | CREATE / ALTER / DROP / RENAME / COMMENT from a console reloads the lists; inside a transaction, after COMMIT. |
 
 ## Query console
 
@@ -43,7 +45,11 @@ What the app covers compared with DataGrip, as of v2, limited to PostgreSQL and 
 | Transactions | Done | Per-console Auto / Manual mode, Commit / Rollback buttons, an open-transaction badge, and a separate connection per console. Closing a console, disconnecting or quitting with an open transaction asks first. |
 | Query history | Done | Per data source, saved between runs |
 | Code completion | Done | Keywords, schemas, tables and columns; resolves aliases from FROM/JOIN. |
-| Inspections, formatting | Not yet | |
+| SQL formatting | Partial | Keywords, clause line breaks, list items, subquery indentation. No options, and procedural blocks are left as written. |
+| Find / replace, comment toggle | Done | |
+| Open / save .sql files | Done | |
+| Restore tabs on restart | Done | Consoles and table tabs with filters; nothing re-runs until shown. |
+| Inspections | Not yet | |
 | Parameters / user variables | Not yet | |
 | EXPLAIN plan view | Not yet | EXPLAIN output appears as a normal result. |
 
@@ -61,7 +67,10 @@ What the app covers compared with DataGrip, as of v2, limited to PostgreSQL and 
 | Export CSV / JSON | Done | Exports the rows currently fetched. |
 | Postgres value decoding | Partial | Numeric, money, temporal values (including infinity), interval, inet/cidr, json(b), uuid, bytea, point, arrays, enums, domains, citext. Other types (ranges, geometric types other than point, tsvector, …) appear as `<type> \x…`. |
 | Edit cells / insert / delete rows in the grid | Done | For results whose columns come from one table with its primary key present. Changes are submitted as one batch, which runs in its own transaction or joins the console's open one. SQLite tables without a primary key are read-only. |
-| Filter / ORDER BY bar on table data | Done | Header clicks on table data also sort server-side. The last filter for each table is remembered for the session. |
+| Filter / ORDER BY bar on table data | Done | Header clicks on table data also sort server-side. The last filter for each table is remembered and restored with the tab. |
+| Refresh a result | Done | Re-runs the result's query in place (Cmd+R). |
+| Value viewer / editor | Done | JSON pretty-printed and highlighted, bytes as hex, multi-line text editing. |
+| Guard against losing pending edits | Done | Re-running, refreshing, filtering or closing asks first. |
 
 ## Navigation
 
@@ -76,5 +85,5 @@ What the app covers compared with DataGrip, as of v2, limited to PostgreSQL and 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Show DDL | Done | SQLite shows the original DDL. Postgres DDL is rebuilt from the catalog, and identity/generated columns, CHECK constraints and FK actions are left out. |
-| Keyboard shortcuts | Partial | Cmd+Enter, Cmd+Shift+Enter, Cmd+N, Cmd+T, Cmd+W, Cmd+O, Ctrl+Space, Cmd+A / Cmd+C in the grid |
+| Keyboard shortcuts | Partial | Cmd+Enter, Cmd+Shift+Enter, Cmd+N, Cmd+T, Cmd+W, Cmd+K, Cmd+O, Cmd+S, Cmd+Shift+S, Cmd+R, Cmd+F, Cmd+/, Cmd+Alt+L, Ctrl+Space, Cmd+A / Cmd+C in the grid |
 | ER diagrams, schema compare, data import, user management | Not yet | |
