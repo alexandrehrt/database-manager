@@ -55,17 +55,6 @@ impl Value {
             Value::Float(f) if f.is_infinite() => {
                 Some(if *f > 0.0 { "Infinity" } else { "-Infinity" }.into())
             }
-            Value::Array(items) => Some(format!(
-                "{{{}}}",
-                items
-                    .iter()
-                    .map(|v| match v.to_param_text() {
-                        None => "NULL".to_string(),
-                        Some(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
             other => Some(other.to_string()),
         }
     }
@@ -91,12 +80,24 @@ impl fmt::Display for Value {
                     if i > 0 {
                         f.write_str(",")?;
                     }
-                    write!(f, "{v}")?;
+                    match v {
+                        Value::Text(s) | Value::Numeric(s) if needs_array_quotes(s) => {
+                            write!(f, "\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))?
+                        }
+                        other => write!(f, "{other}")?,
+                    }
                 }
                 f.write_str("}")
             }
         }
     }
+}
+
+/// Postgres array-literal quoting rule, so the display form is also valid input.
+fn needs_array_quotes(s: &str) -> bool {
+    s.is_empty()
+        || s.eq_ignore_ascii_case("NULL")
+        || s.chars().any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace())
 }
 
 /// The base-table column a result column was read from, when the engine reports it.
