@@ -219,6 +219,16 @@ impl Console {
         run_fresh(statements)
     }
 
+    /// Switching tabs by hand counts as a navigation step, like following a
+    /// link in a browser, so Back returns to the tab that was showing.
+    fn select_result(&mut self, i: usize) {
+        if i != self.active_result {
+            self.nav_back.push(self.active_result);
+            self.nav_forward.clear();
+            self.active_result = i;
+        }
+    }
+
     fn go_back(&mut self) {
         if let Some(prev) = self.nav_back.pop() {
             self.nav_forward.push(self.active_result);
@@ -231,6 +241,28 @@ impl Console {
             self.nav_back.push(self.active_result);
             self.active_result = next;
         }
+    }
+
+    /// Removes result tab `i`, keeping the active tab and the Back/Forward
+    /// stacks pointing at the same results.
+    fn close_result(&mut self, i: usize) {
+        if i >= self.results.len() {
+            return;
+        }
+        self.results.remove(i);
+        let shift = |stack: &mut Vec<usize>| {
+            stack.retain(|&t| t != i);
+            stack.iter_mut().filter(|t| **t > i).for_each(|t| *t -= 1);
+            stack.dedup();
+        };
+        shift(&mut self.nav_back);
+        shift(&mut self.nav_forward);
+        if self.active_result == i {
+            self.active_result = self.nav_back.pop().unwrap_or(i.saturating_sub(1));
+        } else if self.active_result > i {
+            self.active_result -= 1;
+        }
+        self.active_result = self.active_result.min(self.results.len().saturating_sub(1));
     }
 
     fn tab_label(&self, i: usize) -> String {
@@ -246,6 +278,8 @@ impl Console {
         }
         let mut action = None;
         if self.results.len() > 1 {
+            let running = self.run.is_some();
+            let (mut close, mut select) = (None, None);
             ui.horizontal_wrapped(|ui| {
                 for (i, tab) in self.results.iter().enumerate() {
                     let failed = tab.outcome.is_err();
@@ -253,14 +287,32 @@ impl Console {
                     if failed {
                         text = text.color(ui.visuals().error_fg_color);
                     }
-                    if ui.selectable_label(self.active_result == i, text).on_hover_text(&tab.sql).clicked() {
-                        self.active_result = i;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if ui.selectable_label(self.active_result == i, text).on_hover_text(&tab.sql).clicked() {
+                            select = Some(i);
+                        }
+                        // Indices shift on close, so wait for a running statement to land first.
+                        if ui
+                            .add_enabled(!running, egui::Button::new("x").small())
+                            .on_hover_text("Close result")
+                            .clicked()
+                        {
+                            close = Some(i);
+                        }
+                    });
                 }
             });
+            if let Some(i) = select {
+                self.select_result(i);
+            }
+            if let Some(i) = close {
+                self.close_result(i);
+            }
             ui.separator();
         }
-        if !self.nav_back.is_empty() || !self.nav_forward.is_empty() {
+        let navigated = self.results.iter().any(|t| t.title.is_some());
+        if navigated && (!self.nav_back.is_empty() || !self.nav_forward.is_empty()) {
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.nav_back.is_empty(), egui::Button::new("< Back")).clicked() {
                     self.go_back();
@@ -268,12 +320,15 @@ impl Console {
                 if ui.add_enabled(!self.nav_forward.is_empty(), egui::Button::new("Forward >")).clicked() {
                     self.go_forward();
                 }
-                let trail: Vec<String> = self
-                    .nav_back
-                    .iter()
-                    .chain(std::iter::once(&self.active_result))
-                    .map(|&i| self.tab_label(i.min(self.results.len() - 1)))
-                    .collect();
+                const TRAIL: usize = 5;
+                let steps: Vec<usize> =
+                    self.nav_back.iter().copied().chain(std::iter::once(self.active_result)).collect();
+                let shown = &steps[steps.len().saturating_sub(TRAIL)..];
+                let mut trail: Vec<String> =
+                    shown.iter().map(|&i| self.tab_label(i.min(self.results.len() - 1))).collect();
+                if steps.len() > TRAIL {
+                    trail.insert(0, "...".into());
+                }
                 ui.weak(trail.join("  >  "));
             });
             ui.separator();
