@@ -12,6 +12,7 @@ use crate::persist;
 use crate::ui::console::{Console, ConsoleAction, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TableView, TxMode};
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
 use crate::ui::explorer::{self, ConnStatus, Loadable, RelationNode, SchemaNode, SourceTree};
+use crate::ui::goto::{Candidate, GotoOutcome, GotoTable};
 use crate::worker::{Event, Worker};
 
 /// Something the UI asked for while drawing; applied after the frame's UI
@@ -34,6 +35,7 @@ const HISTORY_LIMIT: usize = 200;
 
 const NEW_SOURCE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
 const NEW_CONSOLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
+const GOTO_TABLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
 const CLOSE_TAB: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
 
 enum Tab {
@@ -89,6 +91,8 @@ pub struct App {
     incoming_cache: HashMap<String, HashMap<(String, String), Vec<dbm_core::IncomingKey>>>,
     /// Last WHERE / ORDER BY per (source, schema, table), for this session.
     table_filters: HashMap<(String, String, String), (String, String)>,
+    explorer_filter: String,
+    goto: Option<GotoTable>,
     fk_pending: HashSet<(String, String, String)>,
 }
 
@@ -117,6 +121,8 @@ impl App {
             table_cache: HashMap::new(),
             incoming_cache: HashMap::new(),
             table_filters: HashMap::new(),
+            explorer_filter: String::new(),
+            goto: None,
             fk_pending: HashSet::new(),
         }
     }
@@ -299,6 +305,88 @@ impl App {
         match self.tabs.get(self.active_tab) {
             Some(Tab::Console(c)) => Some(c.source.clone()),
             _ => self.sources.first().map(|s| s.id.clone()),
+        }
+    }
+
+    /// Requests whatever schemas and relations of connected sources aren't
+    /// loaded yet, so the Go to table picker can search them. Returns
+    /// whether anything is still loading.
+    fn load_all_tables(&mut self) -> bool {
+        let mut loading = false;
+        let mut actions = Vec::new();
+        for (source, tree) in &mut self.trees {
+            if tree.status != ConnStatus::Connected {
+                continue;
+            }
+            match &mut tree.schemas {
+                Loadable::NotLoaded => {
+                    tree.schemas = Loadable::Loading;
+                    actions.push(Action::LoadSchemas(source.clone()));
+                    loading = true;
+                }
+                Loadable::Loading => loading = true,
+                Loadable::Loaded(schemas) => {
+                    for schema in schemas {
+                        match schema.relations {
+                            Loadable::NotLoaded => {
+                                schema.relations = Loadable::Loading;
+                                actions.push(Action::LoadRelations(source.clone(), schema.name.clone()));
+                                loading = true;
+                            }
+                            Loadable::Loading => loading = true,
+                            _ => {}
+                        }
+                    }
+                }
+                Loadable::Failed(_) => {}
+            }
+        }
+        for action in actions {
+            self.apply(action);
+        }
+        loading
+    }
+
+    fn goto_candidates(&self) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        for source in &self.sources {
+            let Some(SourceTree { schemas: Loadable::Loaded(schemas), .. }) = self.trees.get(&source.id) else {
+                continue;
+            };
+            for schema in schemas {
+                if let Loadable::Loaded(rels) = &schema.relations {
+                    out.extend(rels.iter().map(|r| Candidate {
+                        source: source.id.clone(),
+                        source_name: source.name.clone(),
+                        schema: schema.name.clone(),
+                        table: r.relation.name.clone(),
+                        is_view: r.relation.kind != dbm_core::RelationKind::Table,
+                    }));
+                }
+            }
+        }
+        out
+    }
+
+    fn goto_ui(&mut self, ctx: &egui::Context) {
+        if self.goto.is_none() {
+            return;
+        }
+        let loading = self.load_all_tables();
+        let candidates = self.goto_candidates();
+        let Some(goto) = &mut self.goto else { return };
+        match goto.show(ctx, &candidates, loading) {
+            Some(GotoOutcome::Open(i)) => {
+                self.goto = None;
+                let c = &candidates[i];
+                self.apply(Action::OpenTable {
+                    source: c.source.clone(),
+                    schema: c.schema.clone(),
+                    table: c.table.clone(),
+                });
+            }
+            Some(GotoOutcome::Close) => self.goto = None,
+            None => {}
         }
     }
 
@@ -656,7 +744,10 @@ impl eframe::App for App {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Quit);
         }
-        if self.dialog.is_none() && self.confirm.is_none() {
+        if self.dialog.is_none() && self.confirm.is_none() && self.goto.is_none() {
+            if ui.input_mut(|i| i.consume_shortcut(&GOTO_TABLE)) {
+                self.goto = Some(GotoTable::default());
+            }
             ui.input_mut(|i| {
                 if i.consume_shortcut(&NEW_SOURCE) {
                     actions.push(Action::NewSource);
@@ -694,6 +785,12 @@ impl eframe::App for App {
                         actions.push(Action::NewConsole(source));
                     }
                     if ui
+                        .add(egui::Button::new("Go to table…").shortcut_text(ctx.format_shortcut(&GOTO_TABLE)))
+                        .clicked()
+                    {
+                        self.goto = Some(GotoTable::default());
+                    }
+                    if ui
                         .add_enabled(
                             !self.tabs.is_empty(),
                             egui::Button::new("Close tab").shortcut_text(ctx.format_shortcut(&CLOSE_TAB)),
@@ -718,7 +815,7 @@ impl eframe::App for App {
         }
 
         egui::Panel::left("explorer").resizable(true).default_size(300.0).min_size(180.0).show(ui, |ui| {
-            explorer::show(ui, &self.sources, &mut self.trees, &mut actions);
+            explorer::show(ui, &self.sources, &mut self.trees, &mut self.explorer_filter, &mut actions);
         });
 
         let mut console_actions = Vec::new();
@@ -818,6 +915,7 @@ impl eframe::App for App {
         }
 
         self.confirm_ui(&ui.ctx().clone());
+        self.goto_ui(&ui.ctx().clone());
 
         if let Some(dialog) = &mut self.dialog
             && let Some(action) = dialog.show(ui.ctx())
