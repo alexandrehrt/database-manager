@@ -417,6 +417,9 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 egui::Layout::left_to_right(egui::Align::Center)
                             };
                             let mut toggled = false;
+                            // The whole cell selects the row. Registered before the content
+                            // so links and checkboxes, added later, sit on top and get their clicks.
+                            let whole = ui.interact(cell, ui.id().with(("cell", idx, c)), egui::Sense::click());
                             let response = ui
                                 .with_layout(layout, |ui| match (&value, boolean) {
                                     (None, _) => {
@@ -456,8 +459,6 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                             {
                                 event = Some(GridEvent::Link(r, c));
                             }
-                            // The whole cell selects the row, not just its text.
-                            let whole = ui.interact(cell, ui.id().with(("cell", idx, c)), egui::Sense::click());
                             if let RowRef::Existing(r) = row_ref {
                                 if whole.clicked() && link.is_none() {
                                     clicked_row = Some((idx, r));

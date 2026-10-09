@@ -739,6 +739,7 @@ impl Console {
             _ => None,
         };
         let editable = matches!(target, Some(Ok(_)));
+        let mut close_result = None;
 
         // Chips, result tabs and the + Row / Export buttons.
         egui::Panel::top(egui::Id::new(("results-bar", self.id)))
@@ -789,7 +790,7 @@ impl Console {
                 if let Some(e) = self.table.as_ref().and_then(|t| t.error.as_ref()).filter(|_| idx == 0) {
                     ui.colored_label(color::DANGER, e);
                 }
-                self.result_tabs(ui, running);
+                close_result = self.result_tabs(ui, running);
             });
 
         if let Some(a) = self.status_bar(ui, idx, target.as_ref()) {
@@ -816,6 +817,9 @@ impl Console {
                 action = Some(a);
             }
         });
+        if let Some(i) = close_result {
+            self.close_result(i);
+        }
         action
     }
 
@@ -883,10 +887,12 @@ impl Console {
     }
 
     /// Result tabs (several statements or navigation) and Back / Forward.
-    fn result_tabs(&mut self, ui: &mut egui::Ui, running: bool) {
+    /// Returns a result tab whose close button was clicked; the caller closes
+    /// it once the frame is drawn, since the rest of the frame indexes results.
+    fn result_tabs(&mut self, ui: &mut egui::Ui, running: bool) -> Option<usize> {
         let navigated = self.results.iter().any(|t| t.title.is_some());
         if self.results.len() < 2 && !navigated {
-            return;
+            return None;
         }
         ui.add_space(4.0);
         let (mut close, mut select) = (None, None);
@@ -933,9 +939,7 @@ impl Console {
         if let Some(i) = select {
             self.select_result(i);
         }
-        if let Some(i) = close {
-            self.close_result(i);
-        }
+        close
     }
 
     fn grid(
