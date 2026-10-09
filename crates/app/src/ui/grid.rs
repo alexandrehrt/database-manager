@@ -108,6 +108,17 @@ pub struct GridOptions<'a> {
     pub dialect: Dialect,
     /// The single table the rows come from, for "Copy as INSERT".
     pub table: Option<&'a str>,
+    /// For a fetched row: the referencing tables that can be opened, as
+    /// (key index, label).
+    pub referencing: &'a dyn Fn(usize) -> Vec<(usize, String)>,
+}
+
+/// Navigation the caller performs, in data-row terms.
+pub enum GridEvent {
+    /// A foreign-key link cell (row, column) was clicked.
+    Link(usize, usize),
+    /// Open the rows of referencing key `key` that point at `row`.
+    Referencing { row: usize, key: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -159,13 +170,13 @@ fn cell_text(v: &Value) -> String {
     s
 }
 
-/// Returns the (row, column) of a foreign-key link clicked this frame, in
-/// data order. Click, Shift+click and Cmd+click select rows; Cmd+A selects
+/// Returns the navigation the user asked for this frame (FK link or
+/// referencing rows), in data order. Click, Shift+click and Cmd+click select rows; Cmd+A selects
 /// all, Cmd+C copies the selection as TSV and Escape clears it. With
 /// `edit`, cells can be edited (double-click), set to NULL and reverted,
 /// rows deleted, and added rows are shown after the fetched ones.
-pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridOptions<'_>) -> Option<(usize, usize)> {
-    let GridOptions { id, is_link, mut edit, selection, dialect, table } = opts;
+pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridOptions<'_>) -> Option<GridEvent> {
+    let GridOptions { id, is_link, mut edit, selection, dialect, table, referencing } = opts;
     sort.refresh(rs);
     selection.rows.retain(|&r| r < rs.rows.len());
 
@@ -329,7 +340,7 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                             let response = if let Some(r) = link {
                                 let resp = ui.link(text);
                                 if resp.clicked() {
-                                    clicked_link = Some((r, c));
+                                    clicked_link = Some(GridEvent::Link(r, c));
                                 }
                                 resp.on_hover_text("Open the referenced row")
                             } else {
@@ -355,6 +366,19 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                 *e.editing = Some(EditingCell { row: row_ref, col: c, buffer, focused: false });
                             }
                             response.context_menu(|ui| {
+                                if let RowRef::Existing(r) = row_ref {
+                                    let targets = referencing(r);
+                                    if !targets.is_empty() {
+                                        ui.menu_button("Referencing rows", |ui| {
+                                            for (key, label) in targets {
+                                                if ui.button(label).clicked() {
+                                                    clicked_link = Some(GridEvent::Referencing { row: r, key });
+                                                }
+                                            }
+                                        });
+                                        ui.separator();
+                                    }
+                                }
                                 if ui.button("Copy value").clicked() {
                                     let copied = match &value {
                                         Some(v) if !v.is_null() => v.to_string(),

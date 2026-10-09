@@ -6,15 +6,15 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use dbm_core::driver::is_read_only_query;
-use dbm_core::fk_nav::{FkLink, ForeignKeyIndex, link_for_cell};
+use dbm_core::fk_nav::{FkLink, ForeignKeyIndex, link_for_cell, referencing_query, referencing_values};
 use dbm_core::statement_at::statement_at;
 use std::collections::HashMap;
 
-use dbm_core::{DbError, Dialect, ExecOutcome, TableDetails, Value, sql_split};
+use dbm_core::{DbError, Dialect, ExecOutcome, IncomingKey, TableDetails, Value, sql_split};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::ui::edits::{self, EditStatement, Edits};
-use crate::ui::grid::{self, EditingCell, GridEdit, GridOptions, Selection, SortState};
+use crate::ui::grid::{self, EditingCell, GridEdit, GridEvent, GridOptions, Selection, SortState};
 use crate::ui::sql_highlight;
 
 pub const PAGE_SIZE: usize = 500;
@@ -158,6 +158,7 @@ impl Console {
         history: &[String],
         fks: &ForeignKeyIndex,
         tables: &HashMap<(String, String), TableDetails>,
+        incoming: &HashMap<(String, String), Vec<IncomingKey>>,
     ) -> Option<ConsoleAction> {
         let mut action = None;
         let editor_id = egui::Id::new(("console-editor", self.id));
@@ -258,7 +259,7 @@ impl Console {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(a) = self.results_ui(ui, fks, tables) {
+            if let Some(a) = self.results_ui(ui, fks, tables, incoming) {
                 action = Some(a);
             }
         });
@@ -377,6 +378,7 @@ impl Console {
         ui: &mut egui::Ui,
         fks: &ForeignKeyIndex,
         tables: &HashMap<(String, String), TableDetails>,
+        incoming: &HashMap<(String, String), Vec<IncomingKey>>,
     ) -> Option<ConsoleAction> {
         if self.results.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -535,6 +537,21 @@ impl Console {
             let edit =
                 matches!(target, Some(Ok(_))).then(|| GridEdit { edits: &mut tab.edits, editing: &mut tab.editing });
             let table = single_table(rs);
+            // Keys in other tables that point at any table this result reads from.
+            let origin_tables: std::collections::BTreeSet<(String, String)> = rs
+                .columns
+                .iter()
+                .filter_map(|c| c.origin.as_ref())
+                .map(|o| (o.schema.clone(), o.table.clone()))
+                .collect();
+            let keys: Vec<&IncomingKey> = origin_tables.iter().filter_map(|t| incoming.get(t)).flatten().collect();
+            let referencing = |row: usize| -> Vec<(usize, String)> {
+                keys.iter()
+                    .enumerate()
+                    .filter(|(_, k)| referencing_values(&rs.columns, &rs.rows[row], k).is_some())
+                    .map(|(i, k)| (i, format!("{} ({})", k.table, k.foreign_key.columns.join(", "))))
+                    .collect()
+            };
             let opts = GridOptions {
                 id: (console_id, idx),
                 is_link: &is_link,
@@ -542,12 +559,23 @@ impl Console {
                 selection: &mut tab.selection,
                 dialect,
                 table: table.as_deref(),
+                referencing: &referencing,
             };
-            if let Some((row, col)) = grid::show(ui, rs, &mut tab.sort, opts)
-                && !running
-                && let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks)
-            {
-                action = Some(navigate(self.dialect, idx, &link));
+            match grid::show(ui, rs, &mut tab.sort, opts) {
+                Some(_) if running => {}
+                Some(GridEvent::Link(row, col)) => {
+                    if let Some(link) = link_for_cell(&rs.columns, &rs.rows[row], col, fks) {
+                        action = Some(navigate(dialect, idx, &link));
+                    }
+                }
+                Some(GridEvent::Referencing { row, key }) => {
+                    if let Some(k) = keys.get(key)
+                        && let Some(values) = referencing_values(&rs.columns, &rs.rows[row], k)
+                    {
+                        action = Some(navigate_referencing(dialect, idx, k, &values));
+                    }
+                }
+                None => {}
             }
         } else {
             ui.add(egui::Label::new(RichText::new(&tab.sql).monospace().weak()).wrap());
@@ -579,6 +607,16 @@ fn navigate(dialect: Dialect, from: usize, link: &FkLink) -> ConsoleAction {
         statements: vec![(sql, params)],
         limit: PAGE_SIZE,
         mode: RunMode::Navigate { from, title: format!("{} ({})", fk.ref_table, key.join(", ")) },
+    }
+}
+
+fn navigate_referencing(dialect: Dialect, from: usize, key: &IncomingKey, values: &[Value]) -> ConsoleAction {
+    let (sql, params) = referencing_query(dialect, key, values);
+    let cond: Vec<String> = key.foreign_key.columns.iter().zip(values).map(|(c, v)| format!("{c} = {v}")).collect();
+    ConsoleAction::Run {
+        statements: vec![(sql, params)],
+        limit: PAGE_SIZE,
+        mode: RunMode::Navigate { from, title: format!("{} ({})", key.table, cond.join(", ")) },
     }
 }
 

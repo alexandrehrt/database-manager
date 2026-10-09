@@ -194,6 +194,18 @@ pub struct ForeignKey {
     pub ref_column_types: Vec<String>,
 }
 
+/// A foreign key in another table that points at the table being looked at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingKey {
+    /// The referencing table.
+    pub schema: String,
+    pub table: String,
+    /// `foreign_key.columns` are in the referencing table; `ref_*` is the target.
+    pub foreign_key: ForeignKey,
+    /// SQL type of each referencing column, for casts; empty when not needed.
+    pub column_types: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TableDetails {
     pub schema: String,

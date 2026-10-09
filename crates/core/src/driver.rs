@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{DbResult, Dialect, ExecOutcome, Relation, TableDetails, Value};
+use crate::{DbResult, Dialect, ExecOutcome, IncomingKey, Relation, TableDetails, Value};
 
 /// An open session to one data source. Calls are serialised by the
 /// implementation; cancellation goes through [`Connection::canceller`] so it
@@ -21,6 +21,9 @@ pub trait Connection: Send + Sync {
     async fn relations(&self, schema: &str) -> DbResult<Vec<Relation>>;
 
     async fn table_details(&self, schema: &str, name: &str) -> DbResult<TableDetails>;
+
+    /// Foreign keys in other tables (of any schema) that reference this one.
+    async fn referencing_keys(&self, schema: &str, name: &str) -> DbResult<Vec<IncomingKey>>;
 
     /// CREATE statement(s) for a table or view.
     async fn ddl(&self, schema: &str, name: &str) -> DbResult<String>;

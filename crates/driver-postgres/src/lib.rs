@@ -238,6 +238,10 @@ impl Connection for PgConnection {
         introspect::table_details(&self.session.lock().await.client, schema, name).await
     }
 
+    async fn referencing_keys(&self, schema: &str, name: &str) -> DbResult<Vec<dbm_core::IncomingKey>> {
+        introspect::referencing_keys(&self.session.lock().await.client, schema, name).await
+    }
+
     async fn ddl(&self, schema: &str, name: &str) -> DbResult<String> {
         introspect::ddl(&self.session.lock().await.client, schema, name).await
     }

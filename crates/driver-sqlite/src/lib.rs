@@ -278,6 +278,37 @@ impl Connection for SqliteConnection {
         self.blocking(move |c| table_details(c, &schema, &name)).await
     }
 
+    /// SQLite foreign keys can only reference tables in the same database, so
+    /// this scans the foreign keys of every table in `schema`.
+    async fn referencing_keys(&self, schema: &str, name: &str) -> DbResult<Vec<dbm_core::IncomingKey>> {
+        let (schema, name) = (schema.to_string(), name.to_string());
+        self.blocking(move |c| {
+            let tables: Vec<String> = c
+                .prepare(&format!(
+                    "SELECT name FROM {}.sqlite_schema WHERE type = 'table' ORDER BY name",
+                    Dialect::Sqlite.quote_ident(&schema)
+                ))?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut keys = Vec::new();
+            for table in tables {
+                for mut fk in foreign_keys(c, &schema, &table)? {
+                    if fk.ref_table.eq_ignore_ascii_case(&name) {
+                        fk.ref_table = name.clone();
+                        keys.push(dbm_core::IncomingKey {
+                            schema: schema.clone(),
+                            table: table.clone(),
+                            foreign_key: fk,
+                            column_types: Vec::new(),
+                        });
+                    }
+                }
+            }
+            Ok(keys)
+        })
+        .await
+    }
+
     /// SQLite keeps the original DDL text, so this returns it verbatim along
     /// with the table's indexes and triggers.
     async fn ddl(&self, schema: &str, name: &str) -> DbResult<String> {
