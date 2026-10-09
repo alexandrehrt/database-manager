@@ -56,6 +56,19 @@ fn same_value(original: &Value, edited: &Value) -> bool {
     }
 }
 
+/// Whether a column holds text, where an empty value is an empty string
+/// rather than NULL. Untyped (SQLite expression) columns count as text.
+pub fn is_texty(type_name: &str) -> bool {
+    let t = type_name.to_lowercase();
+    t.is_empty() || ["char", "text", "clob", "string", "name"].iter().any(|k| t.contains(k))
+}
+
+/// The value an edit buffer stands for: empty means NULL unless the column is
+/// text and the cell wasn't NULL, so leaving a NULL cell empty keeps it NULL.
+pub fn typed_value(text: String, type_name: &str, was_null: bool) -> Value {
+    if text.is_empty() && (was_null || !is_texty(type_name)) { Value::Null } else { Value::Text(text) }
+}
+
 /// "Set to now" for a date / time column: the menu label and the current local
 /// time as text the column's engine reads (Oracle via the session NLS formats).
 pub fn now_value(type_name: &str, dialect: Dialect) -> Option<(&'static str, Value)> {

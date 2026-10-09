@@ -1104,7 +1104,8 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (i, c) in self.tabs.iter().enumerate() {
-                            match tab_button(ui, c, i == self.active_tab) {
+                            let tag = self.source(&c.source).and_then(|s| s.color).map(theme::conn_color);
+                            match tab_button(ui, c, i == self.active_tab, tag) {
                                 TabClick::Activate => activate = Some(i),
                                 TabClick::Close => close = Some(i),
                                 TabClick::None => {}
@@ -1198,10 +1199,16 @@ enum TabClick {
 
 /// One tab of the strip: icon, title, a dot while edits are pending or a
 /// transaction is open, and a close button on the active or hovered tab.
-fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool) -> TabClick {
+/// `tag`: the connection's colour (strong, tint), if it has one.
+fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool, tag: Option<(Color32, Color32)>) -> TabClick {
     let glyph = if c.table.is_some() { icon::TABLE } else { icon::TERMINAL_WINDOW };
     let mut click = TabClick::None;
-    let fill = if active { color::BG } else { Color32::TRANSPARENT };
+    let fill = match (tag, active) {
+        (Some((_, tint)), true) => tint,
+        (Some((_, tint)), false) => tint.gamma_multiply(0.6),
+        (None, true) => color::BG,
+        (None, false) => Color32::TRANSPARENT,
+    };
     let stroke = if active { Stroke::new(1.0, color::BORDER) } else { Stroke::NONE };
     let frame = egui::Frame::new()
         .fill(fill)
@@ -1234,6 +1241,11 @@ fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool) -> TabClick {
             // closing and activating by where the click landed.
             ui.label(RichText::new(icon::X).size(11.0).color(color::TEXT_FAINT)).rect
         });
+    if let Some((strong, _)) = tag {
+        let r = frame.response.rect;
+        let stripe = egui::Rect::from_min_max(r.left_top(), egui::pos2(r.right(), r.top() + 2.5));
+        ui.painter().rect_filled(stripe, egui::CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, strong);
+    }
     let x_rect = frame.inner.expand(4.0);
     let response = frame.response.interact(egui::Sense::click());
     let on_x = response.hover_pos().is_some_and(|p| x_rect.contains(p));
@@ -1278,6 +1290,14 @@ impl App {
         console_actions: &mut Vec<(u64, ConsoleAction)>,
     ) {
         let bar = ui.max_rect();
+        // The active tab's connection colour, as a band along the window's top.
+        if let Some((strong, _)) =
+            self.active().and_then(|c| self.source(&c.source)).and_then(|s| s.color).map(theme::conn_color)
+        {
+            let clip = ui.clip_rect();
+            let band = egui::Rect::from_min_max(clip.left_top(), egui::pos2(clip.right(), clip.top() + 3.0));
+            ui.painter().rect_filled(band, 0.0, strong);
+        }
         ui.horizontal(|ui| {
             ui.set_min_height(28.0);
             self.source_picker(ui, actions);
