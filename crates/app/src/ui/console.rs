@@ -129,6 +129,7 @@ pub struct TableView {
     pub ddl: Option<Result<String, String>>,
     /// Text of the filter being typed, while the "+ Filter" field is open.
     new_filter: Option<String>,
+    focus_filter: bool,
 }
 
 impl TableView {
@@ -143,6 +144,7 @@ impl TableView {
             mode: ViewMode::Content,
             ddl: None,
             new_filter: None,
+            focus_filter: false,
         }
     }
 
@@ -1248,7 +1250,11 @@ impl Console {
                         .hint_text("e.g. vip = true")
                         .desired_width(180.0),
                 );
-                r.request_focus();
+                // Focus only when it opens: grabbing it every frame would undo the
+                // focus loss Enter / Escape / clicking elsewhere cause, and keep it forever.
+                if std::mem::take(&mut tv.focus_filter) {
+                    r.request_focus();
+                }
                 let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
                 if escape {
                     tv.new_filter = None;
@@ -1264,6 +1270,7 @@ impl Console {
             None => {
                 if ui.add_enabled(!running, theme::flat_button(format!("{}  Filter", icon::PLUS))).clicked() {
                     tv.new_filter = Some(String::new());
+                    tv.focus_filter = true;
                 }
             }
         }
