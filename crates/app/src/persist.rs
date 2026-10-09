@@ -1,5 +1,6 @@
 //! Saved data sources (TOML in the app config dir) and their passwords (OS keychain).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -56,4 +57,25 @@ pub fn delete_password(source_id: &str) {
     if let Ok(e) = entry(source_id) {
         let _ = e.delete_credential();
     }
+}
+
+fn history_path() -> anyhow::Result<PathBuf> {
+    Ok(config_path()?.with_file_name("history.json"))
+}
+
+/// Executed statements per data source id, most recent first.
+pub fn load_history() -> HashMap<String, Vec<String>> {
+    history_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_history(history: &HashMap<String, Vec<String>>) -> anyhow::Result<()> {
+    let path = history_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string(history)?).with_context(|| format!("writing {}", path.display()))
 }

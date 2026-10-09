@@ -41,7 +41,8 @@ fn db_err(e: rusqlite::Error) -> DbError {
     } else {
         e.to_string()
     };
-    DbError { message, detail: None, code: code.map(|c| format!("{c:?}")) }
+    let code = code.filter(|c| *c != rusqlite::ErrorCode::Unknown).map(|c| format!("{c:?}"));
+    DbError { message, detail: None, code }
 }
 
 impl SqliteConnection {
