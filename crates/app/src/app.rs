@@ -10,7 +10,8 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 
 use crate::persist;
 use crate::ui::console::{
-    Console, ConsoleAction, ConsoleContext, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TableView, TxMode, ViewMode,
+    self, Console, ConsoleAction, ConsoleContext, PAGE_SIZE, ResultTab, Run, RunMode, Statement, TableView, TxMode,
+    ViewMode,
 };
 use crate::ui::datasource_dialog::{DataSourceDialog, DialogAction, TestState};
 use crate::ui::explorer::{self, ConnStatus, Loadable, SchemaNode, SidebarState, SourceTree};
@@ -22,6 +23,7 @@ use crate::worker::{Event, Worker};
 /// code has released its borrows.
 pub enum Action {
     NewSource,
+    OpenFile,
     EditSource(String),
     SelectSource(String),
     SelectSchema(String, String),
@@ -40,7 +42,6 @@ const HISTORY_LIMIT: usize = 200;
 const NEW_SOURCE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
 const NEW_CONSOLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
 const GOTO_TABLE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
-const GOTO_TABLE_ALT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
 const CLOSE_TAB: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
 
 /// A run requested before its data source finished connecting.
@@ -93,6 +94,10 @@ pub struct App {
     /// Consoles whose DDL is being fetched.
     ddl_pending: HashSet<u64>,
     window_title: String,
+    /// Restored table tabs that load their rows when first shown.
+    restore_pending: HashSet<u64>,
+    last_session: persist::Session,
+    last_session_save: Instant,
 }
 
 impl App {
@@ -102,7 +107,7 @@ impl App {
             Ok(s) => (s, None),
             Err(e) => (Vec::new(), Some(format!("Could not load saved data sources: {e:#}"))),
         };
-        Self {
+        let mut app = Self {
             worker: Worker::new(cc.egui_ctx.clone()),
             current_source: sources.first().map(|s| s.id.clone()),
             sources,
@@ -129,6 +134,125 @@ impl App {
             fk_pending: HashSet::new(),
             ddl_pending: HashSet::new(),
             window_title: String::new(),
+            restore_pending: HashSet::new(),
+            last_session: persist::Session::default(),
+            last_session_save: Instant::now(),
+        };
+        app.restore_session();
+        app
+    }
+
+    /// Reopens the tabs of the last run. Nothing runs until a table tab is shown.
+    fn restore_session(&mut self) {
+        let session = persist::load_session();
+        for tab in &session.tabs {
+            let Some(dialect) = self.source(&tab.source).map(|s| s.kind.dialect()) else { continue };
+            let id = self.next_id();
+            let mut c = Console::new(id, tab.source.clone(), tab.title.clone(), dialect, tab.sql.clone());
+            c.file = tab.file.clone();
+            c.saved_text = tab.saved_text.clone();
+            if let Some(t) = &tab.table {
+                let mut view = TableView::new(t.schema.clone(), t.table.clone(), t.filters.clone(), t.order.clone());
+                view.mode = match t.mode.as_str() {
+                    "structure" => ViewMode::Structure,
+                    "sql" => ViewMode::Sql,
+                    _ => ViewMode::Content,
+                };
+                c.sql = view.sql(dialect);
+                c.table = Some(view);
+                self.restore_pending.insert(id);
+            } else if let Some(n) = tab.title.strip_prefix("console ").and_then(|n| n.parse::<u64>().ok()) {
+                self.console_count = self.console_count.max(n);
+            }
+            self.tabs.push(c);
+        }
+        if !self.tabs.is_empty() {
+            self.activate(session.active.min(self.tabs.len() - 1));
+        }
+        self.last_session = self.session_snapshot();
+    }
+
+    fn session_snapshot(&self) -> persist::Session {
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|c| persist::SessionTab {
+                source: c.source.clone(),
+                title: c.title.clone(),
+                sql: c.sql.clone(),
+                file: c.file.clone(),
+                saved_text: c.saved_text.clone(),
+                table: c.table.as_ref().map(|t| persist::SessionTable {
+                    schema: t.schema.clone(),
+                    table: t.table.clone(),
+                    filters: t.filters.clone(),
+                    order: t.order.clone(),
+                    mode: match t.mode {
+                        ViewMode::Content => "content",
+                        ViewMode::Structure => "structure",
+                        ViewMode::Sql => "sql",
+                    }
+                    .into(),
+                }),
+            })
+            .collect();
+        persist::Session { tabs, active: self.active_tab }
+    }
+
+    /// Saves the open tabs when they changed, at most once a second unless `force`.
+    fn save_session(&mut self, force: bool) {
+        if !force && self.last_session_save.elapsed().as_secs_f32() < 1.0 {
+            return;
+        }
+        let session = self.session_snapshot();
+        if session == self.last_session {
+            return;
+        }
+        self.last_session_save = Instant::now();
+        if let Err(e) = persist::save_session(&session) {
+            self.status = Some(format!("Could not save the session: {e:#}"));
+        }
+        self.last_session = session;
+    }
+
+    /// Loads a restored table tab's rows the first time it is shown.
+    fn load_restored(&mut self) {
+        let Some(c) = self.tabs.get(self.active_tab) else { return };
+        if !self.restore_pending.remove(&c.id) {
+            return;
+        }
+        let Some(tv) = &c.table else { return };
+        let (id, source, schema, table, sql) =
+            (c.id, c.source.clone(), tv.schema.clone(), tv.table.clone(), c.sql.clone());
+        self.schema_choice.insert(source.clone(), schema.clone());
+        self.request_details(&source, id, schema, table);
+        self.start_run(id, vec![(sql, Vec::new())], PAGE_SIZE, RunMode::Filter);
+    }
+
+    /// Opens a .sql file in a new console on the current data source.
+    fn open_file(&mut self) {
+        let Some(source) = self.current_source.clone() else {
+            self.status = Some("Choose a data source before opening a file.".into());
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new().add_filter("SQL", &["sql"]).add_filter("All files", &["*"]).pick_file()
+        else {
+            return;
+        };
+        if let Some(i) = self.tabs.iter().position(|c| c.file.as_ref() == Some(&path)) {
+            return self.activate(i);
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let title = path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+                if let Some(id) = self.new_console(&source, Some(title), text.clone())
+                    && let Some(c) = self.console_mut(id)
+                {
+                    c.file = Some(path);
+                    c.saved_text = Some(text);
+                }
+            }
+            Err(e) => self.status = Some(format!("Could not open {}: {e}", path.display())),
         }
     }
 
@@ -330,7 +454,9 @@ impl App {
     /// Closes tab `i`, first asking if its console has an open transaction.
     fn request_close_tab(&mut self, i: usize) {
         match self.tabs.get(i) {
-            Some(c) if c.in_transaction || c.has_pending_edits() => self.confirm = Some(Confirm::CloseConsole(c.id)),
+            Some(c) if c.in_transaction || c.has_pending_edits() || c.file_dirty() => {
+                self.confirm = Some(Confirm::CloseConsole(c.id))
+            }
             Some(_) => self.close_tab(i),
             None => {}
         }
@@ -639,6 +765,7 @@ impl App {
     fn apply(&mut self, action: Action) {
         match action {
             Action::NewSource => self.dialog = Some(DataSourceDialog::new()),
+            Action::OpenFile => self.open_file(),
             Action::EditSource(id) => {
                 if let Some(s) = self.source(&id) {
                     self.dialog = Some(DataSourceDialog::edit(s));
@@ -778,6 +905,7 @@ impl App {
                     self.worker.submit_edits(conn, console, tab, statements);
                 }
             }
+            ConsoleAction::OpenFile => self.open_file(),
             ConsoleAction::Commit | ConsoleAction::Rollback => {
                 let sql = if matches!(action, ConsoleAction::Commit) { "COMMIT" } else { "ROLLBACK" };
                 if let Some(conn) = self.worker.console_connection(console)
@@ -797,6 +925,12 @@ impl eframe::App for App {
         while let Some(event) = self.worker.try_recv() {
             self.handle_event(event);
         }
+        self.load_restored();
+        self.save_session(false);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_session(true);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -805,15 +939,18 @@ impl eframe::App for App {
         let mut close_active = false;
         if ui.ctx().input(|i| i.viewport().close_requested())
             && !self.quit_confirmed
-            && self.tabs.iter().any(|c| c.in_transaction || c.has_pending_edits())
+            && self.tabs.iter().any(|c| c.in_transaction || c.has_pending_edits() || c.file_dirty())
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Quit);
         }
         if self.dialog.is_none() && self.confirm.is_none() && self.goto.is_none() {
             ui.input_mut(|i| {
-                if i.consume_shortcut(&GOTO_TABLE) || i.consume_shortcut(&GOTO_TABLE_ALT) {
+                if i.consume_shortcut(&GOTO_TABLE) {
                     self.goto = Some(GotoTable::default());
+                }
+                if i.consume_shortcut(&console::OPEN_FILE) {
+                    actions.push(Action::OpenFile);
                 }
                 if i.consume_shortcut(&NEW_SOURCE) {
                     actions.push(Action::NewSource);
@@ -1019,6 +1156,10 @@ fn tab_button(ui: &mut egui::Ui, c: &Console, active: bool) -> TabClick {
             } else {
                 title.color(color::TEXT_WEAK)
             });
+            if c.file_dirty() && !c.has_pending_edits() && !c.in_transaction {
+                ui.label(RichText::new("●").size(8.0).color(color::TEXT_WEAK))
+                    .on_hover_text("Unsaved changes to the file");
+            }
             if c.has_pending_edits() || c.in_transaction {
                 let dot = if c.in_transaction { color::WARNING } else { color::CHANGED_EDGE };
                 ui.label(RichText::new("●").size(8.0).color(dot)).on_hover_text(if c.in_transaction {
@@ -1256,11 +1397,18 @@ impl App {
         let losses = |consoles: Vec<&Console>| {
             let edits = consoles.iter().any(|c| c.has_pending_edits());
             let tx = consoles.iter().any(|c| c.in_transaction);
-            match (edits, tx) {
-                (true, true) => "unsaved grid edits are discarded and the open transaction is rolled back",
-                (true, false) => "unsaved grid edits are discarded",
-                _ => "the open transaction is rolled back",
+            let file = consoles.iter().any(|c| c.file_dirty());
+            let mut parts = Vec::new();
+            if edits {
+                parts.push("unsaved grid edits are discarded");
             }
+            if tx {
+                parts.push("the open transaction is rolled back");
+            }
+            if file {
+                parts.push("unsaved changes to the file are lost");
+            }
+            parts.join(" and ")
         };
         let (message, proceed) = match confirm {
             Confirm::CloseConsole(id) => (
