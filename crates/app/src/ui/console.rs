@@ -28,6 +28,7 @@ const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key:
 pub const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
 pub const OPEN_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
+const DELETE_LINE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::K);
 const MOVE_UP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp);
 const MOVE_DOWN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowDown);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
@@ -188,6 +189,15 @@ pub struct CompletionPopup {
     /// Byte offset of the word being completed.
     start: usize,
     anchor: egui::Pos2,
+}
+
+/// Commands on whole lines of the editor.
+#[derive(Clone, Copy)]
+enum LineCommand {
+    Duplicate,
+    Delete,
+    MoveUp,
+    MoveDown,
 }
 
 /// The editor's find / replace bar.
@@ -682,6 +692,19 @@ impl Console {
                             self.toggle_comment(ui, editor_id);
                             ui.close();
                         }
+                        ui.separator();
+                        for (label, shortcut, command) in [
+                            ("Duplicate line", &DUPLICATE, LineCommand::Duplicate),
+                            ("Delete line", &DELETE_LINE, LineCommand::Delete),
+                            ("Move line up", &MOVE_UP, LineCommand::MoveUp),
+                            ("Move line down", &MOVE_DOWN, LineCommand::MoveDown),
+                        ] {
+                            if ui.add(egui::Button::new(label).shortcut_text(ctx.format_shortcut(shortcut))).clicked() {
+                                self.line_command(ui, editor_id, command);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
                         if ui.add(egui::Button::new("Format SQL").shortcut_text(ctx.format_shortcut(&FORMAT))).clicked()
                         {
                             self.format_sql(ui, editor_id);
@@ -1212,22 +1235,25 @@ impl Console {
     /// keys: Cmd+D, Alt+Up / Down, Enter with indentation, paired brackets and
     /// quotes, and Backspace inside an empty pair.
     fn editor_keys(&mut self, ui: &egui::Ui, editor_id: egui::Id) {
+        let command = ui.input_mut(|i| {
+            if i.consume_shortcut(&DELETE_LINE) {
+                Some(LineCommand::Delete)
+            } else if i.consume_shortcut(&DUPLICATE) {
+                Some(LineCommand::Duplicate)
+            } else if i.consume_shortcut(&MOVE_UP) {
+                Some(LineCommand::MoveUp)
+            } else if i.consume_shortcut(&MOVE_DOWN) {
+                Some(LineCommand::MoveDown)
+            } else {
+                None
+            }
+        });
+        if let Some(command) = command {
+            self.line_command(ui, editor_id, command);
+        }
         let Some((mut start, mut end)) = self.editor_selection(ui.ctx(), editor_id) else { return };
         let mut text = self.sql.clone();
         let mut changed = false;
-        let (dup, up, down) = ui.input_mut(|i| {
-            (i.consume_shortcut(&DUPLICATE), i.consume_shortcut(&MOVE_UP), i.consume_shortcut(&MOVE_DOWN))
-        });
-        let line_edit = if dup {
-            Some(editor_ops::duplicate_lines(&text, start, end))
-        } else if up || down {
-            editor_ops::move_lines(&text, start, end, up)
-        } else {
-            None
-        };
-        if let Some((t, a, b)) = line_edit {
-            (text, start, end, changed) = (t, a, b, true);
-        }
         ui.input_mut(|i| {
             let mut keep = Vec::with_capacity(i.events.len());
             // Once the text field must handle an edit, it handles the rest of the
@@ -1330,6 +1356,22 @@ impl Console {
             self.sql = text;
             self.select_in_editor(ui.ctx(), editor_id, start..end);
             self.reveal_byte = Some(end);
+        }
+    }
+
+    /// Applies a line command to the selected lines, or the cursor's line.
+    fn line_command(&mut self, ui: &egui::Ui, editor_id: egui::Id, command: LineCommand) {
+        let Some((start, end)) = self.editor_selection(ui.ctx(), editor_id) else { return };
+        let edit = match command {
+            LineCommand::Duplicate => Some(editor_ops::duplicate_lines(&self.sql, start, end)),
+            LineCommand::Delete => Some(editor_ops::delete_lines(&self.sql, start, end)),
+            LineCommand::MoveUp => editor_ops::move_lines(&self.sql, start, end, true),
+            LineCommand::MoveDown => editor_ops::move_lines(&self.sql, start, end, false),
+        };
+        if let Some((text, a, b)) = edit {
+            self.sql = text;
+            self.select_in_editor(ui.ctx(), editor_id, a..b);
+            self.reveal_byte = Some(b);
         }
     }
 

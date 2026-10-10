@@ -1,4 +1,5 @@
-//! Splits a script into statements on top-level semicolons.
+//! Splits a script into statements on top-level semicolons, and on blank
+//! lines, so a statement missing its `;` still ends where the next one starts.
 //!
 //! Semicolons inside string literals, quoted identifiers, comments,
 //! Postgres dollar-quoted bodies, SQLite trigger bodies (`BEGIN … END`) and
@@ -6,6 +7,9 @@
 //! For Oracle, PL/SQL blocks (anonymous `BEGIN`/`DECLARE` blocks and
 //! `CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER/TYPE`) run until a line holding
 //! only `/`, which also ends ordinary statements, as in SQL*Plus.
+//!
+//! A blank line ends a statement only at the top level: not inside
+//! parentheses, literals, comments or the bodies above.
 
 use std::ops::Range;
 
@@ -33,12 +37,21 @@ struct Statement {
     head: Vec<String>,
     prev_word: String,
     block_depth: u32,
+    paren_depth: u32,
 }
 
 impl Statement {
     fn mark_code(&mut self, start: usize, end: usize) {
         self.code_start.get_or_insert(start);
         self.code_end = end;
+    }
+
+    /// Whether a blank line here may end the statement.
+    fn breaks_on_blank_line(&self, dialect: Dialect) -> bool {
+        self.code_start.is_some()
+            && self.block_depth == 0
+            && self.paren_depth == 0
+            && !(dialect == Dialect::Oracle && self.is_plsql())
     }
 
     fn has_body_blocks(&self, dialect: Dialect) -> bool {
@@ -159,8 +172,20 @@ impl Splitter<'_> {
                     stmt.on_word(word, self.dialect);
                     stmt.mark_code(start, self.i);
                 }
+                b'\n' if self.next_line_blank() && stmt.breaks_on_blank_line(self.dialect) => {
+                    if let Some(s) = stmt.code_start {
+                        spans.push(s..stmt.code_end);
+                    }
+                    stmt = Statement::default();
+                    self.i += 1;
+                }
                 b if b.is_ascii_whitespace() => self.i += 1,
                 _ => {
+                    match b {
+                        b'(' => stmt.paren_depth += 1,
+                        b')' => stmt.paren_depth = stmt.paren_depth.saturating_sub(1),
+                        _ => {}
+                    }
                     self.i += 1;
                     stmt.mark_code(start, self.i);
                 }
@@ -170,6 +195,11 @@ impl Splitter<'_> {
             spans.push(s..stmt.code_end);
         }
         spans
+    }
+
+    /// Whether the line after the newline at the cursor holds only whitespace.
+    fn next_line_blank(&self) -> bool {
+        self.src[self.i + 1..].iter().take_while(|&&b| b != b'\n').all(u8::is_ascii_whitespace)
     }
 
     /// Whether the `/` at the cursor is alone on its line.

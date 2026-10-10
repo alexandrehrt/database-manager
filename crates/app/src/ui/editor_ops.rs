@@ -121,3 +121,14 @@ pub fn backspace(text: &str, start: usize, end: usize) -> Option<Edit> {
     let out = format!("{}{}", &text[..a], &text[start + next.len_utf8()..]);
     Some((out, a, a))
 }
+
+/// Cmd+Shift+K: deletes the selected lines (or the cursor's line) and puts the
+/// cursor at the start of the line that takes their place.
+pub fn delete_lines(text: &str, start: usize, end: usize) -> Edit {
+    let (a, b) = line_span(text, start, end);
+    // Take the line's newline with it; on the last line, the one before it.
+    let (from, to) = if b < text.len() { (a, b + 1) } else { (a.saturating_sub(1), b) };
+    let out = format!("{}{}", &text[..from], &text[to..]);
+    let at = if b < text.len() { a } else { out[..from].rfind('\n').map_or(0, |p| p + 1) };
+    (out, at, at)
+}
