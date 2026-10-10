@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="20" height="20">
+  <title>Cuia — marca para a interface (16–24 px)</title>
+  <path d="M282 430 C282 610 330 840 512 840 C694 840 742 610 742 430" fill="none" stroke="#1F2328" stroke-width="80" stroke-linecap="round"/>
+  <ellipse cx="512" cy="430" rx="230" ry="64" fill="#2F5FD0" stroke="#1F2328" stroke-width="80"/>
+  <line x1="585" y1="420" x2="735" y2="175" stroke="#1F2328" stroke-width="80" stroke-linecap="round"/>
+</svg>

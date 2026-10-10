@@ -99,6 +99,8 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 pub fn install(ctx: &egui::Context) {
+    // Renders the SVG brand marks.
+    egui_extras::install_image_loaders(ctx);
     install_fonts(ctx);
     ctx.set_theme(egui::Theme::Light);
     ctx.style_mut_of(egui::Theme::Light, |style| {
@@ -184,4 +186,15 @@ pub fn pill(ui: &mut egui::Ui, text: egui::RichText, fill: Color32) -> egui::Res
         .inner_margin(Margin::symmetric(7, 2))
         .show(ui, |ui| ui.label(text))
         .response
+}
+
+/// The Cuia mark at `size` points: the detailed drawing from 32 points up,
+/// the simplified one below that.
+pub fn brand_mark(size: f32) -> egui::Image<'static> {
+    let source = if size >= 32.0 {
+        egui::include_image!("../../assets/brand/cuia-mark.svg")
+    } else {
+        egui::include_image!("../../assets/brand/cuia-mark-small.svg")
+    };
+    egui::Image::new(source).fit_to_exact_size(egui::vec2(size, size))
 }
