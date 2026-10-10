@@ -359,6 +359,9 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                         Some(color::ADDED)
                     } else if selected {
                         Some(color::ACCENT_SOFT)
+                    } else if idx % 2 == 1 {
+                        // Zebra stripes, by displayed position so they survive sorting.
+                        Some(color::STRIPE)
                     } else {
                         None
                     };
@@ -504,10 +507,12 @@ pub fn show(ui: &mut egui::Ui, rs: &ResultSet, sort: &mut SortState, opts: GridO
                                     (Some(Value::Text(t)), None) if t.is_empty() => ui
                                         .label(RichText::new("''").font(mono.clone()).color(color::TEXT_FAINT))
                                         .on_hover_text("Empty string"),
-                                    (Some(Value::Null), _) => theme::pill(
-                                        ui,
-                                        RichText::new("NULL").size(10.0).color(color::TEXT_WEAK),
-                                        color::BG_SUNKEN,
+                                    // Plain faint italics: a filled pill blends into striped rows.
+                                    (Some(Value::Null), _) => ui.add(
+                                        egui::Label::new(
+                                            RichText::new("NULL").font(mono.clone()).italics().color(color::TEXT_FAINT),
+                                        )
+                                        .selectable(false),
                                     ),
                                     (Some(_), Some(b)) => {
                                         let r = checkbox_glyph(ui, b);
