@@ -34,6 +34,8 @@ pub mod color {
     pub const BG: Color32 = Color32::from_rgb(255, 255, 255);
     pub const BG_SUBTLE: Color32 = Color32::from_rgb(247, 247, 249);
     pub const BG_SUNKEN: Color32 = Color32::from_rgb(241, 241, 244);
+    /// Every other row of the results grid.
+    pub const STRIPE: Color32 = Color32::from_rgb(245, 245, 248);
     pub const BORDER: Color32 = Color32::from_rgb(226, 226, 232);
     pub const CHANGED: Color32 = Color32::from_rgb(255, 248, 214);
     pub const CHANGED_EDGE: Color32 = Color32::from_rgb(232, 196, 64);
