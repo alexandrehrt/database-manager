@@ -1059,7 +1059,9 @@ impl eframe::App for App {
         }
         if self.dialog.is_none() && self.confirm.is_none() && self.goto.is_none() {
             ui.input_mut(|i| {
-                if i.consume_shortcut(&GOTO_TABLE) {
+                // Shortcut matching tolerates an extra Shift, which would take the
+                // editor's Cmd+Shift+K (delete line).
+                if !i.modifiers.shift && i.consume_shortcut(&GOTO_TABLE) {
                     self.goto = Some(GotoTable::default());
                 }
                 if i.consume_shortcut(&console::OPEN_FILE) {
