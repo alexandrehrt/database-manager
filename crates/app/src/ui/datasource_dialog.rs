@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use dbm_core::config::{ConnColor, DataSourceConfig, DataSourceKind, SslMode};
+use dbm_core::config::{ConnColor, DataSourceConfig, DataSourceKind, SshAuth, SshConfig, SslMode};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, Stroke};
 
 use crate::ui::theme::{self, color, icon};
@@ -17,6 +17,13 @@ enum Engine {
     Postgres,
     Sqlite,
     Oracle,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SshMethod {
+    Password,
+    Key,
+    Agent,
 }
 
 pub enum TestState {
@@ -43,6 +50,16 @@ pub struct DataSourceDialog {
     service: String,
     /// Oracle Instant Client folder; empty means the system library path.
     client_dir: String,
+    ssh: bool,
+    ssh_host: String,
+    ssh_port: String,
+    ssh_user: String,
+    ssh_method: SshMethod,
+    ssh_key: String,
+    /// SSH password or key passphrase.
+    ssh_secret: String,
+    show_ssh_secret: bool,
+    ssh_verify: bool,
     pub test: Option<TestState>,
     error: Option<String>,
 }
@@ -52,12 +69,15 @@ pub enum DialogAction {
     Save {
         config: DataSourceConfig,
         password: Option<String>,
+        /// SSH password or key passphrase.
+        ssh_secret: Option<String>,
         save_password: bool,
         connect: bool,
     },
     Test {
         config: DataSourceConfig,
         password: Option<String>,
+        ssh_secret: Option<String>,
     },
     Delete(String),
     Close,
@@ -82,6 +102,15 @@ impl DataSourceDialog {
             path: String::new(),
             service: "FREEPDB1".into(),
             client_dir: String::new(),
+            ssh: false,
+            ssh_host: String::new(),
+            ssh_port: "22".into(),
+            ssh_user: String::new(),
+            ssh_method: SshMethod::Key,
+            ssh_key: "~/.ssh/id_ed25519".into(),
+            ssh_secret: String::new(),
+            show_ssh_secret: false,
+            ssh_verify: true,
             test: None,
             error: None,
         }
@@ -93,6 +122,21 @@ impl DataSourceDialog {
         d.name = config.name.clone();
         d.color = config.color;
         d.read_only = config.read_only;
+        if let Some(ssh) = &config.ssh {
+            d.ssh = true;
+            d.ssh_host = ssh.host.clone();
+            d.ssh_port = ssh.port.to_string();
+            d.ssh_user = ssh.user.clone();
+            d.ssh_verify = ssh.verify_host_key;
+            d.ssh_method = match &ssh.auth {
+                SshAuth::Password => SshMethod::Password,
+                SshAuth::Key { path } => {
+                    d.ssh_key = path.display().to_string();
+                    SshMethod::Key
+                }
+                SshAuth::Agent => SshMethod::Agent,
+            };
+        }
         match &config.kind {
             DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
                 d.engine = Engine::Postgres;
@@ -120,6 +164,34 @@ impl DataSourceDialog {
 
     fn password(&self) -> Option<String> {
         (!self.password.is_empty()).then(|| self.password.clone())
+    }
+
+    fn ssh_secret(&self) -> Option<String> {
+        let used = self.ssh && self.engine != Engine::Sqlite && self.ssh_method != SshMethod::Agent;
+        (used && !self.ssh_secret.is_empty()).then(|| self.ssh_secret.clone())
+    }
+
+    fn ssh_config(&self) -> Result<Option<SshConfig>, String> {
+        if !self.ssh || self.engine == Engine::Sqlite {
+            return Ok(None);
+        }
+        if self.ssh_host.trim().is_empty() || self.ssh_user.trim().is_empty() {
+            return Err("SSH host and user are required".into());
+        }
+        let port = self.ssh_port.trim().parse().map_err(|_| "SSH port must be a number between 1 and 65535")?;
+        let auth = match self.ssh_method {
+            SshMethod::Password => SshAuth::Password,
+            SshMethod::Agent => SshAuth::Agent,
+            SshMethod::Key if self.ssh_key.trim().is_empty() => return Err("Choose an SSH private key file".into()),
+            SshMethod::Key => SshAuth::Key { path: PathBuf::from(self.ssh_key.trim()) },
+        };
+        Ok(Some(SshConfig {
+            host: self.ssh_host.trim().to_string(),
+            port,
+            user: self.ssh_user.trim().to_string(),
+            auth,
+            verify_host_key: self.ssh_verify,
+        }))
     }
 
     fn kind(&self) -> Result<DataSourceKind, String> {
@@ -165,7 +237,8 @@ impl DataSourceDialog {
             n => n.to_string(),
         };
         let id = self.editing.clone().unwrap_or_else(new_id);
-        Ok(DataSourceConfig { id, name, kind, color: self.color, read_only: self.read_only })
+        let ssh = self.ssh_config()?;
+        Ok(DataSourceConfig { id, name, kind, color: self.color, read_only: self.read_only, ssh })
     }
 
     fn save(&mut self, connect: bool) -> Option<DialogAction> {
@@ -173,6 +246,7 @@ impl DataSourceDialog {
             Ok(config) => Some(DialogAction::Save {
                 config,
                 password: self.password(),
+                ssh_secret: self.ssh_secret(),
                 save_password: self.save_password,
                 connect,
             }),
@@ -208,7 +282,11 @@ impl DataSourceDialog {
                     divider(ui);
                     match self.engine {
                         Engine::Sqlite => self.sqlite_fields(ui),
-                        Engine::Postgres | Engine::Oracle => self.server_fields(ui),
+                        Engine::Postgres | Engine::Oracle => {
+                            self.server_fields(ui);
+                            divider(ui);
+                            self.ssh_fields(ui);
+                        }
                     }
                     divider(ui);
                     self.identification(ui);
@@ -393,6 +471,93 @@ impl DataSourceDialog {
         }
     }
 
+    fn ssh_fields(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let mut toggled = crate::ui::grid::checkbox_glyph(ui, self.ssh).clicked();
+            toggled |= ui
+                .add(
+                    egui::Label::new(RichText::new("SSH tunnel").font(theme::font(13.0, theme::semibold())))
+                        .sense(egui::Sense::click()),
+                )
+                .clicked();
+            if toggled {
+                self.ssh = !self.ssh;
+            }
+            ui.label(RichText::new("connect through a bastion host").small().color(color::TEXT_WEAK));
+        });
+        if !self.ssh {
+            return;
+        }
+        ui.add_space(4.0);
+        let gap = 12.0;
+        let full = CONTENT;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            labeled(ui, "SSH host", full - 96.0 - gap, |ui| input(ui, &mut self.ssh_host, "bastion.example.com"));
+            labeled(ui, "Port", 96.0, |ui| input(ui, &mut self.ssh_port, ""));
+        });
+        let segmented_width = 3.0 * 72.0 + 10.0;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            labeled(ui, "SSH user", full - segmented_width - gap, |ui| input(ui, &mut self.ssh_user, ""));
+            labeled(ui, "Authentication", segmented_width, |ui| {
+                segmented(
+                    ui,
+                    &mut self.ssh_method,
+                    &[(SshMethod::Key, "key file"), (SshMethod::Password, "password"), (SshMethod::Agent, "agent")],
+                );
+            });
+        });
+        let hint = if self.editing.is_some() { "unchanged" } else { "" };
+        match self.ssh_method {
+            SshMethod::Password => {
+                labeled(ui, "SSH password", full, |ui| {
+                    password_input(ui, &mut self.ssh_secret, &mut self.show_ssh_secret, hint);
+                });
+            }
+            SshMethod::Key => {
+                labeled(ui, "Private key", full, |ui| {
+                    ui.horizontal(|ui| {
+                        let w = ui.available_width() - 96.0;
+                        ui.add_sized([w, 30.0], text_edit(&mut self.ssh_key, "~/.ssh/id_ed25519"));
+                        if ui
+                            .add_sized([88.0, 30.0], egui::Button::new(format!("{}  Browse", icon::FOLDER_OPEN)))
+                            .clicked()
+                        {
+                            let mut picker = rfd::FileDialog::new();
+                            if let Some(dir) = std::env::home_dir().map(|h| h.join(".ssh")).filter(|d| d.is_dir()) {
+                                picker = picker.set_directory(dir);
+                            }
+                            if let Some(p) = picker.pick_file() {
+                                self.ssh_key = p.display().to_string();
+                            }
+                        }
+                    });
+                });
+                let hint = if self.editing.is_some() { "unchanged" } else { "only if the key is encrypted" };
+                labeled(ui, "Passphrase", full, |ui| {
+                    password_input(ui, &mut self.ssh_secret, &mut self.show_ssh_secret, hint);
+                });
+            }
+            SshMethod::Agent => {
+                ui.label(
+                    RichText::new("Uses the keys loaded in ssh-agent (ssh-add -l lists them).")
+                        .small()
+                        .color(color::TEXT_WEAK),
+                );
+            }
+        }
+        ui.add_space(2.0);
+        ui.checkbox(&mut self.ssh_verify, "Verify the host key against ~/.ssh/known_hosts").on_hover_text(
+            "Protects against a server impersonating the bastion. Connect once with `ssh` to add the host.",
+        );
+        ui.label(
+            RichText::new("Host and port above are as seen from the bastion, e.g. localhost or a private address.")
+                .small()
+                .color(color::TEXT_WEAK),
+        );
+    }
+
     fn sqlite_fields(&mut self, ui: &mut egui::Ui) {
         section(ui, "File");
         let full = CONTENT;
@@ -522,7 +687,13 @@ impl DataSourceDialog {
                     {
                         self.error = None;
                         match self.to_config() {
-                            Ok(config) => action = Some(DialogAction::Test { config, password: self.password() }),
+                            Ok(config) => {
+                                action = Some(DialogAction::Test {
+                                    config,
+                                    password: self.password(),
+                                    ssh_secret: self.ssh_secret(),
+                                })
+                            }
                             Err(e) => self.error = Some(e),
                         }
                     }

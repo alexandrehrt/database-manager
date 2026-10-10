@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/driver-sqlite", "crates/driver-postgres", "crates/driver-oracle", "crates/app"]
+members = ["crates/core", "crates/driver-sqlite", "crates/driver-postgres", "crates/driver-oracle", "crates/ssh", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ dbm-core = { path = "crates/core" }
 dbm-driver-sqlite = { path = "crates/driver-sqlite" }
 dbm-driver-postgres = { path = "crates/driver-postgres" }
 dbm-driver-oracle = { path = "crates/driver-oracle" }
+dbm-ssh = { path = "crates/ssh" }
 async-trait = "0.1"
 thiserror = "2"
 anyhow = "1"

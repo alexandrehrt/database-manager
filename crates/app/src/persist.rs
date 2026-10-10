@@ -52,6 +52,11 @@ pub fn save_password(source_id: &str, password: &str) -> anyhow::Result<()> {
     Ok(entry(source_id)?.set_password(password)?)
 }
 
+/// Keychain entry of a source's SSH password or key passphrase.
+pub fn ssh_entry(source_id: &str) -> String {
+    format!("{source_id}/ssh")
+}
+
 pub fn delete_password(source_id: &str) {
     // A missing entry is the desired end state, so the error is irrelevant.
     if let Ok(e) = entry(source_id) {

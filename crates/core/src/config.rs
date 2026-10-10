@@ -17,6 +17,38 @@ pub struct DataSourceConfig {
     /// Block statements and grid edits that change data or schema.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+    /// Reach the server through an SSH bastion. Ignored for SQLite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshConfig>,
+}
+
+/// SSH tunnel settings. The password or key passphrase is kept in the OS
+/// keychain like the database password.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuth,
+    /// Require the bastion's host key to be in ~/.ssh/known_hosts.
+    #[serde(default = "yes")]
+    pub verify_host_key: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "lowercase")]
+pub enum SshAuth {
+    Password,
+    /// A private key file; its passphrase, if any, is the stored secret.
+    Key {
+        path: PathBuf,
+    },
+    /// Keys held by the running ssh-agent.
+    Agent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

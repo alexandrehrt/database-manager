@@ -18,7 +18,7 @@ use crate::ui::diagram::Diagram;
 use crate::ui::explorer::{self, ConnStatus, Loadable, SchemaNode, SidebarState, SourceTree};
 use crate::ui::goto::{Candidate, GotoOutcome, GotoTable};
 use crate::ui::theme::{self, color, icon};
-use crate::worker::{Event, Worker};
+use crate::worker::{Event, Secrets, Worker};
 
 /// Something the UI asked for while drawing; applied after the frame's UI
 /// code has released its borrows.
@@ -334,8 +334,8 @@ impl App {
             let first = pending.is_empty();
             pending.push(PendingRun { statements, limit, mode });
             if first && let Some(config) = self.source(&source).cloned() {
-                let password = self.session_passwords.get(&source).cloned();
-                self.worker.connect_console(console_id, config, password);
+                let secrets = self.secrets(&source);
+                self.worker.connect_console(console_id, config, secrets);
             }
             // The explorer connection serves metadata, such as foreign keys for links.
             if self.worker.connection(&source).is_none()
@@ -886,9 +886,9 @@ impl App {
             }
             Action::Connect(id) => {
                 if let Some(config) = self.source(&id).cloned() {
-                    let password = self.session_passwords.get(&id).cloned();
+                    let secrets = self.secrets(&id);
                     self.tree(&id).status = ConnStatus::Connecting;
-                    self.worker.connect(config, password);
+                    self.worker.connect(config, secrets);
                 }
             }
             Action::Disconnect(id) => {
@@ -926,31 +926,42 @@ impl App {
         }
     }
 
+    /// Passwords typed this session for `source`; the worker reads the keychain for the rest.
+    fn secrets(&self, source: &str) -> Secrets {
+        Secrets {
+            db: self.session_passwords.get(source).cloned(),
+            ssh: self.session_passwords.get(&persist::ssh_entry(source)).cloned(),
+        }
+    }
+
     fn apply_dialog(&mut self, action: DialogAction) {
         match action {
             DialogAction::Close => self.dialog = None,
-            DialogAction::Test { config, password } => {
+            DialogAction::Test { config, password, ssh_secret } => {
                 self.next_test_nonce += 1;
                 let nonce = self.next_test_nonce;
-                let password = password.or_else(|| self.session_passwords.get(&config.id).cloned());
+                let saved = self.secrets(&config.id);
+                let secrets = Secrets { db: password.or(saved.db), ssh: ssh_secret.or(saved.ssh) };
                 if let Some(d) = &mut self.dialog {
                     d.test = Some(TestState::Running(nonce));
                 }
-                self.worker.test(nonce, config, password);
+                self.worker.test(nonce, config, secrets);
             }
-            DialogAction::Save { config, password, save_password, connect } => {
-                if let Some(pw) = password {
+            DialogAction::Save { config, password, ssh_secret, save_password, connect } => {
+                let entries = [(config.id.clone(), password), (persist::ssh_entry(&config.id), ssh_secret)];
+                for (entry, secret) in entries {
+                    let Some(pw) = secret else { continue };
                     if save_password {
-                        if let Err(e) = persist::save_password(&config.id, &pw) {
+                        if let Err(e) = persist::save_password(&entry, &pw) {
                             if let Some(d) = &mut self.dialog {
                                 d.set_error(format!("Could not save the password to the Keychain: {e:#}"));
                             }
                             return;
                         }
-                        self.session_passwords.remove(&config.id);
+                        self.session_passwords.remove(&entry);
                     } else {
-                        persist::delete_password(&config.id);
-                        self.session_passwords.insert(config.id.clone(), pw);
+                        persist::delete_password(&entry);
+                        self.session_passwords.insert(entry, pw);
                     }
                 }
                 let id = config.id.clone();
@@ -971,7 +982,9 @@ impl App {
                 self.sources.retain(|s| s.id != id);
                 self.persist_sources();
                 persist::delete_password(&id);
+                persist::delete_password(&persist::ssh_entry(&id));
                 self.session_passwords.remove(&id);
+                self.session_passwords.remove(&persist::ssh_entry(&id));
                 self.disconnect_source(&id);
                 if self.current_source.as_deref() == Some(id.as_str()) {
                     self.current_source = self.sources.first().map(|s| s.id.clone());
