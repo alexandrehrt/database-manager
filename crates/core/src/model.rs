@@ -148,6 +148,15 @@ impl DbError {
     pub fn new(message: impl Into<String>) -> Self {
         Self { message: message.into(), detail: None, code: None, position: None }
     }
+
+    /// The message with its detail on the next line, for one-off displays
+    /// such as connection failures.
+    pub fn with_detail(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}\n{detail}", self.message),
+            None => self.message.clone(),
+        }
+    }
 }
 
 pub type DbResult<T> = Result<T, DbError>;
