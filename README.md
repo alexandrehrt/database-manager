@@ -42,10 +42,13 @@ Then use **File → New data source…** to add them. For the SQLite database, p
 
 ## Oracle
 
-Oracle connections need **Oracle Instant Client** (the free Basic package) from
-[oracle.com](https://www.oracle.com/database/technologies/instant-client/downloads.html). Either put it on the system
-library path, or set its folder in the connection's **Instant Client** field. It is loaded once per run, so restart
-the app after changing that folder.
+Oracle connections need no extra software: the app uses Oracle's pure-Rust thin driver
+([rust-oracledb](https://github.com/oracle/rust-oracledb)), which talks to the database directly. It supports Oracle
+Database 12c and later.
+
+The thin driver can't interrupt a running statement, so **Cancel** abandons it instead: the console gets a fresh
+session at once, and the database finishes the abandoned statement on its own and rolls back its uncommitted changes.
+If the console has an open transaction, the app asks first, since that transaction is rolled back too.
 
 To try it locally, run Oracle Free in Docker and load the Oracle version of the sample data:
 
@@ -120,7 +123,7 @@ The window follows a fixed layout. The top bar holds the data source picker, the
 | `crates/core` (`dbm-core`) | Shared model and the async `Connection` trait. Also the engine-independent logic: statement splitting, statement at cursor, FK navigation, export, DDL. |
 | `crates/driver-sqlite` | SQLite driver (rusqlite, bundled) |
 | `crates/driver-postgres` | PostgreSQL driver (tokio-postgres, native-tls) |
-| `crates/driver-oracle` | Oracle driver (`oracle` crate over ODPI-C; needs Instant Client at run time) |
+| `crates/driver-oracle` | Oracle driver (`oracledb`, Oracle's pure-Rust thin driver; no client libraries needed) |
 | `crates/app` | The egui application |
 
 There is no automated test suite yet. Each change was checked by building it, running clippy and doing a walkthrough against the sample databases. The pull requests record those walkthroughs.
