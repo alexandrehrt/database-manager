@@ -8,13 +8,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use dbm_core::config::{DataSourceConfig, DataSourceKind};
+use dbm_core::config::{DataSourceConfig, DataSourceKind, SshAuth};
 use dbm_core::{Connection, DbError, DbResult, IncomingKey, Relation, StatementResult, TableDetails, Value};
 use eframe::egui;
 
 use crate::persist;
 
 pub type SharedConnection = Arc<dyn Connection>;
+
+/// Passwords typed this session (or not saved); `None` reads the keychain.
+#[derive(Clone, Default)]
+pub struct Secrets {
+    pub db: Option<String>,
+    /// SSH password or key passphrase.
+    pub ssh: Option<String>,
+}
 
 pub enum Event {
     Incoming {
@@ -145,22 +153,22 @@ impl Worker {
         self.console_connections.remove(&console);
     }
 
-    pub fn connect_console(&self, console: u64, config: DataSourceConfig, password: Option<String>) {
-        self.spawn(async move { Event::ConsoleConnected { console, result: open(&config, password).await } });
+    pub fn connect_console(&self, console: u64, config: DataSourceConfig, secrets: Secrets) {
+        self.spawn(async move { Event::ConsoleConnected { console, result: open(&config, secrets).await } });
     }
 
-    /// `password` overrides the keychain; `None` reads the saved one.
-    pub fn connect(&self, config: DataSourceConfig, password: Option<String>) {
+    /// `secrets` override the keychain; `None`s read the saved ones.
+    pub fn connect(&self, config: DataSourceConfig, secrets: Secrets) {
         self.spawn(async move {
-            let result = open(&config, password).await;
+            let result = open(&config, secrets).await;
             Event::Connected { source: config.id, result }
         });
     }
 
-    pub fn test(&self, nonce: u64, config: DataSourceConfig, password: Option<String>) {
+    pub fn test(&self, nonce: u64, config: DataSourceConfig, secrets: Secrets) {
         self.spawn(async move {
             let started = std::time::Instant::now();
-            let result = match open(&config, password).await {
+            let result = match open(&config, secrets).await {
                 Ok(conn) => {
                     let ms = started.elapsed().as_millis();
                     Ok(format!("{} · {ms} ms", server_version(conn.as_ref()).await))
@@ -333,17 +341,55 @@ async fn server_version(conn: &dyn Connection) -> String {
     }
 }
 
-/// The given password, else the one saved in the keychain.
-async fn password_for(config: &DataSourceConfig, password: Option<String>) -> DbResult<Option<String>> {
+/// The given password, else the one saved in the keychain under `entry`.
+async fn password_for(entry: String, password: Option<String>) -> DbResult<Option<String>> {
     if password.is_some() {
         return Ok(password);
     }
-    let id = config.id.clone();
-    tokio::task::spawn_blocking(move || persist::load_password(&id)).await.map_err(|e| DbError::new(e.to_string()))
+    tokio::task::spawn_blocking(move || persist::load_password(&entry)).await.map_err(|e| DbError::new(e.to_string()))
 }
 
-async fn open(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
-    let conn = open_engine(config, password).await?;
+async fn open(config: &DataSourceConfig, secrets: Secrets) -> DbResult<SharedConnection> {
+    let password = match server_address(&config.kind) {
+        Some(_) => password_for(config.id.clone(), secrets.db).await?,
+        None => None,
+    };
+    let tunnel = match (&config.ssh, server_address(&config.kind)) {
+        (Some(ssh), Some((host, port))) => {
+            let secret = password_for(persist::ssh_entry(&config.id), secrets.ssh).await?;
+            let auth = match &ssh.auth {
+                SshAuth::Password => dbm_ssh::Auth::Password(secret.unwrap_or_default()),
+                SshAuth::Key { path } => dbm_ssh::Auth::Key { path: path.clone(), passphrase: secret },
+                SshAuth::Agent => dbm_ssh::Auth::Agent,
+            };
+            let params = dbm_ssh::TunnelParams {
+                host: ssh.host.clone(),
+                port: ssh.port,
+                user: ssh.user.clone(),
+                auth,
+                verify_host_key: ssh.verify_host_key,
+                target_host: host.to_string(),
+                target_port: port,
+            };
+            Some(dbm_ssh::open(params).await.map_err(DbError::new)?)
+        }
+        _ => None,
+    };
+    let conn = match &tunnel {
+        // The driver connects to the tunnel's local end instead of the server.
+        Some(t) => open_engine(&with_address(&config.kind, "127.0.0.1", t.local_port()), password).await,
+        None => open_engine(&config.kind, password).await,
+    }
+    .map_err(|mut e| {
+        if tunnel.is_some() {
+            e.message = format!("{} (through the SSH tunnel)", e.message);
+        }
+        e
+    })?;
+    let conn = match tunnel {
+        Some(tunnel) => Arc::new(Tunneled { conn, _tunnel: tunnel }),
+        None => conn,
+    };
     if config.read_only {
         // The engine enforces it too where it can; Oracle relies on the app's checks.
         let sql = match conn.dialect() {
@@ -358,10 +404,26 @@ async fn open(config: &DataSourceConfig, password: Option<String>) -> DbResult<S
     Ok(conn)
 }
 
-async fn open_engine(config: &DataSourceConfig, password: Option<String>) -> DbResult<SharedConnection> {
-    match &config.kind {
+/// Host and port of a network server; `None` for SQLite.
+fn server_address(kind: &DataSourceKind) -> Option<(&str, u16)> {
+    match kind {
+        DataSourceKind::Postgres { host, port, .. } | DataSourceKind::Oracle { host, port, .. } => Some((host, *port)),
+        DataSourceKind::Sqlite { .. } => None,
+    }
+}
+
+fn with_address(kind: &DataSourceKind, new_host: &str, new_port: u16) -> DataSourceKind {
+    let mut kind = kind.clone();
+    if let DataSourceKind::Postgres { host, port, .. } | DataSourceKind::Oracle { host, port, .. } = &mut kind {
+        *host = new_host.to_string();
+        *port = new_port;
+    }
+    kind
+}
+
+async fn open_engine(kind: &DataSourceKind, password: Option<String>) -> DbResult<SharedConnection> {
+    match kind {
         DataSourceKind::Oracle { host, port, service, user, client_dir } => {
-            let password = password_for(config, password).await?;
             let conn = dbm_driver_oracle::connect(dbm_driver_oracle::OracleParams {
                 host,
                 port: *port,
@@ -375,15 +437,6 @@ async fn open_engine(config: &DataSourceConfig, password: Option<String>) -> DbR
         }
         DataSourceKind::Sqlite { path } => Ok(Arc::new(dbm_driver_sqlite::connect(path).await?)),
         DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
-            let password = match password {
-                Some(p) => Some(p),
-                None => {
-                    let id = config.id.clone();
-                    tokio::task::spawn_blocking(move || persist::load_password(&id))
-                        .await
-                        .map_err(|e| DbError::new(e.to_string()))?
-                }
-            };
             let conn = dbm_driver_postgres::connect(dbm_driver_postgres::PgParams {
                 host,
                 port: *port,
@@ -395,5 +448,50 @@ async fn open_engine(config: &DataSourceConfig, password: Option<String>) -> DbR
             .await?;
             Ok(Arc::new(conn))
         }
+    }
+}
+
+/// A connection that keeps its SSH tunnel open for as long as it lives.
+struct Tunneled {
+    conn: SharedConnection,
+    _tunnel: dbm_ssh::Tunnel,
+}
+
+#[async_trait::async_trait]
+impl Connection for Tunneled {
+    fn dialect(&self) -> dbm_core::Dialect {
+        self.conn.dialect()
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value], max_rows: Option<usize>) -> DbResult<dbm_core::ExecOutcome> {
+        self.conn.execute(sql, params, max_rows).await
+    }
+
+    async fn schemas(&self) -> DbResult<Vec<String>> {
+        self.conn.schemas().await
+    }
+
+    async fn relations(&self, schema: &str) -> DbResult<Vec<Relation>> {
+        self.conn.relations(schema).await
+    }
+
+    async fn table_details(&self, schema: &str, name: &str) -> DbResult<TableDetails> {
+        self.conn.table_details(schema, name).await
+    }
+
+    async fn referencing_keys(&self, schema: &str, name: &str) -> DbResult<Vec<IncomingKey>> {
+        self.conn.referencing_keys(schema, name).await
+    }
+
+    async fn ddl(&self, schema: &str, name: &str) -> DbResult<String> {
+        self.conn.ddl(schema, name).await
+    }
+
+    fn canceller(&self) -> Arc<dyn dbm_core::Canceller> {
+        self.conn.canceller()
+    }
+
+    async fn in_transaction(&self) -> bool {
+        self.conn.in_transaction().await
     }
 }

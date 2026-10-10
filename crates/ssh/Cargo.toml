@@ -1,0 +1,9 @@
+[package]
+name = "dbm-ssh"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util"] }
+# ring rather than aws-lc-rs: no cmake/assembler toolchain needed for the x86_64 macOS cross build.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
