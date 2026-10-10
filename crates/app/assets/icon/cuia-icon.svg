@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Cuia</title>
+  <rect width="1024" height="1024" rx="230" fill="#1F2328"/>
+  <path d="M282 430 C282 610 330 840 512 840 C694 840 742 610 742 430 Z" fill="#F7F8FA"/>
+  <path d="M297 598 Q512 668 727 598" fill="none" stroke="#B8BEC6" stroke-width="18" stroke-linecap="round"/>
+  <path d="M329 702 Q512 762 695 702" fill="none" stroke="#B8BEC6" stroke-width="18" stroke-linecap="round"/>
+  <ellipse cx="512" cy="430" rx="230" ry="64" fill="#D5D9DF"/>
+  <ellipse cx="512" cy="426" rx="196" ry="48" fill="#2F5FD0"/>
+  <line x1="585" y1="425" x2="735" y2="175" stroke="#DCE6FB" stroke-width="30" stroke-linecap="round"/>
+</svg>

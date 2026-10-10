@@ -24,6 +24,7 @@ use crate::worker::{Event, Worker};
 /// code has released its borrows.
 pub enum Action {
     NewSource,
+    GotoTable,
     OpenFile,
     EditSource(String),
     SelectSource(String),
@@ -873,6 +874,7 @@ impl App {
         match action {
             Action::NewSource => self.dialog = Some(DataSourceDialog::new()),
             Action::OpenFile => self.open_file(),
+            Action::GotoTable => self.goto = Some(GotoTable::default()),
             Action::EditSource(id) => {
                 if let Some(s) = self.source(&id) {
                     self.dialog = Some(DataSourceDialog::edit(s));
@@ -1181,12 +1183,7 @@ impl eframe::App for App {
                 return;
             }
             let Some(c) = self.tabs.get_mut(self.active_tab) else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Pick a table in the sidebar, press Cmd+K to find one, or + for a console.")
-                            .color(color::TEXT_WEAK),
-                    );
-                });
+                welcome(ui, &mut actions, self.current_source.clone(), self.sources.is_empty());
                 return;
             };
             let history = self.history.get(&c.source).map(Vec::as_slice).unwrap_or_default();
@@ -1350,8 +1347,9 @@ impl App {
                     }
                 }
             },
-            None => "Database Manager".into(),
+            None => String::new(),
         };
+        let title = if title.is_empty() { "Cuia".to_string() } else { format!("{title} — Cuia") };
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.window_title = title;
@@ -1375,6 +1373,9 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.set_min_height(28.0);
+            ui.add(theme::brand_mark(18.0));
+            ui.label(RichText::new("Cuia").font(theme::font(14.0, theme::semibold())).color(color::TEXT));
+            ui.add(egui::Separator::default().vertical().spacing(14.0));
             self.source_picker(ui, actions);
             self.breadcrumb(ui, actions);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1617,6 +1618,46 @@ impl App {
             }
         }
     }
+}
+
+/// What the main area shows with no tab open: the Cuia mark and the ways to start.
+fn welcome(ui: &mut egui::Ui, actions: &mut Vec<Action>, source: Option<String>, no_sources: bool) {
+    let ctx = ui.ctx().clone();
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() / 2.0 - 190.0).max(24.0));
+        ui.add(theme::brand_mark(88.0));
+        ui.add_space(10.0);
+        ui.label(RichText::new("Cuia").font(theme::font(30.0, theme::semibold())).color(color::TEXT));
+        ui.label(RichText::new("A database client for PostgreSQL, SQLite and Oracle").color(color::TEXT_WEAK));
+        ui.add_space(22.0);
+        let item = |ui: &mut egui::Ui, glyph: &str, label: &str, shortcut: &egui::KeyboardShortcut, enabled: bool| {
+            let button = egui::Button::new(RichText::new(format!("{glyph}   {label}")).size(14.0))
+                .shortcut_text(RichText::new(ctx.format_shortcut(shortcut)).color(color::TEXT_FAINT))
+                .min_size(egui::vec2(300.0, 34.0))
+                .fill(color::BG);
+            ui.add_enabled(enabled, button).clicked()
+        };
+        if no_sources {
+            if item(ui, icon::PLUS, "New connection", &NEW_SOURCE, true) {
+                actions.push(Action::NewSource);
+            }
+        } else {
+            if item(ui, icon::TERMINAL_WINDOW, "New console", &NEW_CONSOLE, source.is_some())
+                && let Some(s) = source.clone()
+            {
+                actions.push(Action::NewConsole(s));
+            }
+            if item(ui, icon::MAGNIFYING_GLASS, "Go to table", &GOTO_TABLE, true) {
+                actions.push(Action::GotoTable);
+            }
+            if item(ui, icon::FILE_TEXT, "Open a .sql file", &console::OPEN_FILE, source.is_some()) {
+                actions.push(Action::OpenFile);
+            }
+            if item(ui, icon::PLUS, "New connection", &NEW_SOURCE, true) {
+                actions.push(Action::NewSource);
+            }
+        }
+    });
 }
 
 /// A segmented control: a sunken track with the selected option raised.

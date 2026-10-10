@@ -1,6 +1,8 @@
-# database-manager
+<p align="center"><img src="crates/app/assets/icon/cuia-icon.svg" width="96" alt="Cuia"></p>
 
-A desktop database client written in Rust, modelled on DataGrip's feature set. It supports PostgreSQL, SQLite and Oracle and uses an [egui](https://github.com/emilk/egui) interface. It also has DBeaver-style foreign-key navigation in the results grid.
+# Cuia
+
+Cuia is a desktop database client written in Rust, modelled on DataGrip's feature set. It supports PostgreSQL, SQLite and Oracle and uses an [egui](https://github.com/emilk/egui) interface. It also has DBeaver-style foreign-key navigation in the results grid.
 
 Work was tracked in the [v1](https://github.com/alexandrehrt/database-manager/issues/8), [v2](https://github.com/alexandrehrt/database-manager/issues/24) and [v3](https://github.com/alexandrehrt/database-manager/issues/47) epics. [docs/parity.md](docs/parity.md) lists which DataGrip features exist and which don't.
 
@@ -18,11 +20,11 @@ cargo run --release -p database-manager
 scripts/bundle-macos.sh ~/Downloads
 ```
 
-This builds `Database Manager.app`. Drag it into **Applications** and open it from there or from Spotlight. The app is
+This builds `Cuia.app`. Drag it into **Applications** and open it from there or from Spotlight. The app is
 signed ad hoc, which is enough on the Mac that built it; sharing it with other Macs needs an Apple Developer ID signature
 and notarization (#56).
 
-CI also builds the program for Windows (`database-manager.exe`), macOS and Linux on every push to `main`; download it
+CI also builds the program for Windows (`database-manager.exe`, with the Cuia icon), macOS and Linux on every push to `main`; download it
 from the run's **Artifacts** on the Actions tab.
 
 ## Try it with the sample database
