@@ -9,10 +9,11 @@
 mod decode;
 mod introspect;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dbm_core::config::SslMode;
+use dbm_core::config::{SslMode, TlsFiles};
 use dbm_core::driver::is_read_only_query;
 use dbm_core::{
     Canceller, Column, ColumnOrigin, Connection, DbError, DbResult, Dialect, ExecOutcome, Relation, ResultSet,
@@ -20,13 +21,14 @@ use dbm_core::{
 };
 use postgres_native_tls::MakeTlsConnector;
 use tokio::sync::Mutex;
+use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::types::Type;
 use tokio_postgres::{CancelToken, Client, Row, Statement};
 
 pub struct PgConnection {
     session: Mutex<Session>,
     cancel: CancelToken,
-    tls: MakeTlsConnector,
+    tls: Tls,
 }
 
 struct Session {
@@ -42,6 +44,10 @@ pub struct PgParams<'a> {
     pub user: &'a str,
     pub password: Option<&'a str>,
     pub ssl_mode: SslMode,
+    pub tls: &'a TlsFiles,
+    /// The name the server certificate must carry when `host` is not it,
+    /// e.g. 127.0.0.1 at the local end of an SSH tunnel.
+    pub tls_host: Option<&'a str>,
 }
 
 pub async fn connect(p: PgParams<'_>) -> DbResult<PgConnection> {
@@ -56,25 +62,123 @@ pub async fn connect(p: PgParams<'_>) -> DbResult<PgConnection> {
         .ssl_mode(match p.ssl_mode {
             SslMode::Disable => tokio_postgres::config::SslMode::Disable,
             SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
-            SslMode::Require => tokio_postgres::config::SslMode::Require,
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
         });
     if let Some(pw) = p.password {
         config.password(pw);
     }
-    // libpq's prefer/require encrypt without verifying the certificate.
-    let connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .map_err(|e| DbError::new(e.to_string()))?;
-    let tls = MakeTlsConnector::new(connector);
-    let (client, connection) = config.connect(tls.clone()).await.map_err(pg_err)?;
+    let tls =
+        Tls { inner: MakeTlsConnector::new(tls_connector(p.ssl_mode, p.tls)?), domain: p.tls_host.map(Into::into) };
+    let (client, connection) =
+        config.connect(tls.clone()).await.map_err(|e| tls_hint(pg_err(e), p.ssl_mode, p.tls_host.unwrap_or(p.host)))?;
     tokio::spawn(connection);
     Ok(PgConnection {
         cancel: client.cancel_token(),
         session: Mutex::new(Session { client, in_user_transaction: false }),
         tls,
     })
+}
+
+fn read(path: &Path, what: &str) -> DbResult<Vec<u8>> {
+    std::fs::read(path).map_err(|e| DbError::new(format!("Cannot read the {what} {}: {e}", path.display())))
+}
+
+/// libpq semantics: prefer / require encrypt without checking the
+/// certificate; verify-ca checks the chain; verify-full also the host name.
+/// A CA file replaces the system's trusted roots, as `sslrootcert` does.
+fn tls_connector(mode: SslMode, files: &TlsFiles) -> DbResult<native_tls::TlsConnector> {
+    let mut builder = native_tls::TlsConnector::builder();
+    builder.danger_accept_invalid_certs(!mode.verifies()).danger_accept_invalid_hostnames(mode != SslMode::VerifyFull);
+    if mode.verifies()
+        && let Some(path) = &files.root_cert
+    {
+        let pem = read(path, "CA certificate")?;
+        let certs = pem_blocks(&pem, "CERTIFICATE");
+        if certs.is_empty() {
+            return Err(DbError::new(format!("{} contains no PEM certificate", path.display())));
+        }
+        for block in certs {
+            let cert = native_tls::Certificate::from_pem(&block)
+                .map_err(|e| DbError::new(format!("Invalid certificate in {}: {e}", path.display())))?;
+            builder.add_root_certificate(cert);
+        }
+        builder.disable_built_in_roots(true);
+    }
+    match (&files.client_cert, &files.client_key) {
+        (Some(cert), Some(key)) => {
+            let (cert_pem, key_pem) = (read(cert, "client certificate")?, read(key, "client key")?);
+            if pem_blocks(&key_pem, "PRIVATE KEY").is_empty() {
+                return Err(DbError::new(format!(
+                    "{} is not a PKCS#8 key (BEGIN PRIVATE KEY). Convert it with: \
+                     openssl pkcs8 -topk8 -nocrypt -in {0} -out client.pk8",
+                    key.display()
+                )));
+            }
+            let identity = native_tls::Identity::from_pkcs8(&cert_pem, &key_pem)
+                .map_err(|e| DbError::new(format!("Cannot use the client certificate: {e}")))?;
+            builder.identity(identity);
+        }
+        (None, None) => {}
+        _ => return Err(DbError::new("A client certificate needs both the certificate and its key")),
+    }
+    builder.build().map_err(|e| DbError::new(e.to_string()))
+}
+
+/// The PEM blocks labelled `label` (e.g. every certificate of a CA bundle).
+fn pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
+    let text = String::from_utf8_lossy(pem);
+    let (begin, end) = (format!("-----BEGIN {label}-----"), format!("-----END {label}-----"));
+    let mut blocks = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find(&begin) {
+        let Some(stop) = rest[start..].find(&end) else { break };
+        let stop = start + stop + end.len();
+        blocks.push(rest.as_bytes()[start..stop].to_vec());
+        rest = &rest[stop..];
+    }
+    blocks
+}
+
+/// Adds what to do about a certificate the handshake rejected.
+fn tls_hint(mut e: DbError, mode: SslMode, host: &str) -> DbError {
+    if !mode.verifies() || e.code.is_some() {
+        return e;
+    }
+    let lower = e.message.to_lowercase();
+    if lower.contains("hostname") || lower.contains("host name") || lower.contains("not valid for") {
+        e.detail = Some(format!(
+            "The server certificate does not name {host}. Connect with the name it was issued for, or use verify-ca."
+        ));
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("trust") {
+        e.detail = Some(
+            "The server certificate is not signed by a trusted CA. Choose the CA certificate file the server's \
+             certificate was issued from."
+                .into(),
+        );
+    }
+    e
+}
+
+/// Hands the TLS layer the host name to verify, which differs from the
+/// address connected to when going through a tunnel.
+#[derive(Clone)]
+struct Tls {
+    inner: MakeTlsConnector,
+    domain: Option<String>,
+}
+
+impl<S> MakeTlsConnect<S> for Tls
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    type Stream = postgres_native_tls::TlsStream<S>;
+    type TlsConnect = postgres_native_tls::TlsConnector;
+    type Error = native_tls::Error;
+
+    fn make_tls_connect(&mut self, domain: &str) -> Result<Self::TlsConnect, Self::Error> {
+        let domain = self.domain.as_deref().unwrap_or(domain);
+        MakeTlsConnect::<S>::make_tls_connect(&mut self.inner, domain)
+    }
 }
 
 pub(crate) fn pg_err(e: tokio_postgres::Error) -> DbError {
@@ -89,7 +193,19 @@ pub(crate) fn pg_err(e: tokio_postgres::Error) -> DbError {
                 _ => None,
             },
         },
-        None => DbError::new(e.to_string()),
+        // tokio-postgres' own text is generic ("error performing TLS handshake"); the cause says why.
+        None => {
+            let mut message = e.to_string();
+            let mut source = std::error::Error::source(&e);
+            while let Some(cause) = source {
+                let text = cause.to_string();
+                if !message.contains(&text) {
+                    message = format!("{message}: {text}");
+                }
+                source = cause.source();
+            }
+            DbError::new(message)
+        }
     }
 }
 
@@ -262,7 +378,7 @@ impl Connection for PgConnection {
 
 struct PgCanceller {
     token: CancelToken,
-    tls: MakeTlsConnector,
+    tls: Tls,
 }
 
 #[async_trait]

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use dbm_core::config::{ConnColor, DataSourceConfig, DataSourceKind, SshAuth, SshConfig, SslMode};
+use dbm_core::config::{ConnColor, DataSourceConfig, DataSourceKind, SshAuth, SshConfig, SslMode, TlsFiles};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, Stroke};
 
 use crate::ui::theme::{self, color, icon};
@@ -46,6 +46,10 @@ pub struct DataSourceDialog {
     show_password: bool,
     save_password: bool,
     ssl_mode: SslMode,
+    root_cert: String,
+    client_cert_on: bool,
+    client_cert: String,
+    client_key: String,
     path: String,
     service: String,
     /// Oracle Instant Client folder; empty means the system library path.
@@ -99,6 +103,10 @@ impl DataSourceDialog {
             show_password: false,
             save_password: true,
             ssl_mode: SslMode::Prefer,
+            root_cert: String::new(),
+            client_cert_on: false,
+            client_cert: String::new(),
+            client_key: String::new(),
             path: String::new(),
             service: "FREEPDB1".into(),
             client_dir: String::new(),
@@ -138,7 +146,12 @@ impl DataSourceDialog {
             };
         }
         match &config.kind {
-            DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
+            DataSourceKind::Postgres { host, port, database, user, ssl_mode, tls } => {
+                let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                d.root_cert = path(&tls.root_cert);
+                d.client_cert = path(&tls.client_cert);
+                d.client_key = path(&tls.client_key);
+                d.client_cert_on = tls.client_cert.is_some() || tls.client_key.is_some();
                 d.engine = Engine::Postgres;
                 d.host = host.clone();
                 d.port = port.to_string();
@@ -164,6 +177,23 @@ impl DataSourceDialog {
 
     fn password(&self) -> Option<String> {
         (!self.password.is_empty()).then(|| self.password.clone())
+    }
+
+    fn tls_files(&self) -> Result<TlsFiles, String> {
+        let path = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(PathBuf::from);
+        let mut files = TlsFiles::default();
+        if self.ssl_mode == SslMode::Disable {
+            return Ok(files);
+        }
+        files.root_cert = path(&self.root_cert);
+        if self.client_cert_on {
+            files.client_cert = path(&self.client_cert);
+            files.client_key = path(&self.client_key);
+            if files.client_cert.is_none() || files.client_key.is_none() {
+                return Err("A client certificate needs both the certificate and the key file".into());
+            }
+        }
+        Ok(files)
     }
 
     fn ssh_secret(&self) -> Option<String> {
@@ -207,6 +237,7 @@ impl DataSourceDialog {
                     database: self.database.trim().to_string(),
                     user: self.user.trim().to_string(),
                     ssl_mode: self.ssl_mode,
+                    tls: self.tls_files()?,
                 }
             }
             Engine::Sqlite => {
@@ -425,31 +456,7 @@ impl DataSourceDialog {
         });
 
         if self.engine == Engine::Postgres {
-            ui.add_space(4.0);
-            // Explicit widths: a right-to-left layout here would widen the dialog.
-            let segmented_width = 3.0 * 72.0 + 10.0;
-            ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(full - segmented_width - 8.0, 34.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_width(full - segmented_width - 8.0);
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(RichText::new("SSL").font(theme::font(12.5, theme::medium())));
-                        let help = match self.ssl_mode {
-                            SslMode::Disable => "disable: never use SSL",
-                            SslMode::Prefer => "prefer: use SSL if the server offers it",
-                            SslMode::Require => "require: always encrypt (certificate not checked)",
-                        };
-                        ui.label(RichText::new(help).small().color(color::TEXT_WEAK));
-                    },
-                );
-                segmented(
-                    ui,
-                    &mut self.ssl_mode,
-                    &[(SslMode::Disable, "disable"), (SslMode::Prefer, "prefer"), (SslMode::Require, "require")],
-                );
-            });
+            self.ssl_fields(ui);
         }
         if self.engine == Engine::Oracle {
             ui.add_space(4.0);
@@ -468,6 +475,58 @@ impl DataSourceDialog {
                 RichText::new("Download Oracle Instant Client (Basic package)").small(),
                 "https://www.oracle.com/database/technologies/instant-client/downloads.html",
             );
+        }
+    }
+
+    fn ssl_fields(&mut self, ui: &mut egui::Ui) {
+        let full = CONTENT;
+        ui.add_space(4.0);
+        ui.label(RichText::new("SSL").font(theme::font(12.5, theme::medium())));
+        segmented(
+            ui,
+            &mut self.ssl_mode,
+            &[
+                (SslMode::Disable, "disable"),
+                (SslMode::Prefer, "prefer"),
+                (SslMode::Require, "require"),
+                (SslMode::VerifyCa, "verify-ca"),
+                (SslMode::VerifyFull, "verify-full"),
+            ],
+        );
+        let help = match self.ssl_mode {
+            SslMode::Disable => "Never use SSL.",
+            SslMode::Prefer => "Use SSL if the server offers it; the certificate is not checked.",
+            SslMode::Require => "Always encrypt; the certificate is not checked.",
+            SslMode::VerifyCa => "Encrypt, and the certificate must be signed by a trusted CA.",
+            SslMode::VerifyFull => "Encrypt, the certificate must be signed by a trusted CA and name the host.",
+        };
+        ui.label(RichText::new(help).small().color(color::TEXT_WEAK));
+        if self.ssl_mode == SslMode::Disable {
+            return;
+        }
+        if self.ssl_mode.verifies() {
+            ui.add_space(2.0);
+            labeled(ui, "CA certificate (optional)", full, |ui| {
+                file_input(ui, &mut self.root_cert, "uses the system's trusted CAs if empty");
+            });
+        }
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let mut toggled = crate::ui::grid::checkbox_glyph(ui, self.client_cert_on).clicked();
+            toggled |= ui.add(egui::Label::new("Client certificate").sense(egui::Sense::click())).clicked();
+            if toggled {
+                self.client_cert_on = !self.client_cert_on;
+            }
+            ui.label(RichText::new("for servers that require one").small().color(color::TEXT_WEAK));
+        });
+        if self.client_cert_on {
+            let gap = 12.0;
+            let half = (full - gap) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                labeled(ui, "Certificate", half, |ui| file_input(ui, &mut self.client_cert, "client.crt"));
+                labeled(ui, "Key (PKCS#8)", half, |ui| file_input(ui, &mut self.client_key, "client.key"));
+            });
         }
     }
 
@@ -681,10 +740,21 @@ impl DataSourceDialog {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let testing = matches!(self.test, Some(TestState::Running(_)));
-                    if ui
-                        .add_enabled(!testing, egui::Button::new(format!("{}  Test connection", icon::LIGHTNING)))
-                        .clicked()
-                    {
+                    // While testing, a spinner takes the icon's place.
+                    let label = if testing {
+                        "      Testing…".to_string()
+                    } else {
+                        format!("{}  Test connection", icon::LIGHTNING)
+                    };
+                    let test = ui.add_enabled(!testing, egui::Button::new(label));
+                    if testing {
+                        let at = egui::Rect::from_center_size(
+                            egui::pos2(test.rect.left() + 16.0, test.rect.center().y),
+                            egui::vec2(13.0, 13.0),
+                        );
+                        egui::Spinner::new().size(13.0).paint_at(ui, at);
+                    }
+                    if test.clicked() {
                         self.error = None;
                         match self.to_config() {
                             Ok(config) => {
@@ -751,6 +821,20 @@ fn labeled(ui: &mut egui::Ui, label: &str, width: f32, add: impl FnOnce(&mut egu
 
 fn text_edit<'a>(value: &'a mut String, hint: &str) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(value).hint_text(hint).margin(egui::vec2(10.0, 7.0)).desired_width(f32::INFINITY)
+}
+
+/// A path field with a Browse button that picks a file.
+fn file_input(ui: &mut egui::Ui, value: &mut String, hint: &str) {
+    ui.horizontal(|ui| {
+        let w = ui.available_width() - 40.0;
+        ui.add_sized([w, 30.0], text_edit(value, hint));
+        let browse = ui.add_sized([32.0, 30.0], egui::Button::new(icon::FOLDER_OPEN)).on_hover_text("Browse");
+        if browse.clicked()
+            && let Some(p) = rfd::FileDialog::new().pick_file()
+        {
+            *value = p.display().to_string();
+        }
+    });
 }
 
 fn input(ui: &mut egui::Ui, value: &mut String, hint: &str) {

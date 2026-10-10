@@ -377,8 +377,11 @@ async fn open(config: &DataSourceConfig, secrets: Secrets) -> DbResult<SharedCon
     };
     let conn = match &tunnel {
         // The driver connects to the tunnel's local end instead of the server.
-        Some(t) => open_engine(&with_address(&config.kind, "127.0.0.1", t.local_port()), password).await,
-        None => open_engine(&config.kind, password).await,
+        Some(t) => {
+            let real_host = server_address(&config.kind).map(|(host, _)| host);
+            open_engine(&with_address(&config.kind, "127.0.0.1", t.local_port()), real_host, password).await
+        }
+        None => open_engine(&config.kind, None, password).await,
     }
     .map_err(|mut e| {
         if tunnel.is_some() {
@@ -421,7 +424,12 @@ fn with_address(kind: &DataSourceKind, new_host: &str, new_port: u16) -> DataSou
     kind
 }
 
-async fn open_engine(kind: &DataSourceKind, password: Option<String>) -> DbResult<SharedConnection> {
+/// `tls_host` is the server's real name when `kind` points at a tunnel.
+async fn open_engine(
+    kind: &DataSourceKind,
+    tls_host: Option<&str>,
+    password: Option<String>,
+) -> DbResult<SharedConnection> {
     match kind {
         DataSourceKind::Oracle { host, port, service, user, client_dir } => {
             let conn = dbm_driver_oracle::connect(dbm_driver_oracle::OracleParams {
@@ -436,7 +444,7 @@ async fn open_engine(kind: &DataSourceKind, password: Option<String>) -> DbResul
             Ok(Arc::new(conn))
         }
         DataSourceKind::Sqlite { path } => Ok(Arc::new(dbm_driver_sqlite::connect(path).await?)),
-        DataSourceKind::Postgres { host, port, database, user, ssl_mode } => {
+        DataSourceKind::Postgres { host, port, database, user, ssl_mode, tls } => {
             let conn = dbm_driver_postgres::connect(dbm_driver_postgres::PgParams {
                 host,
                 port: *port,
@@ -444,6 +452,8 @@ async fn open_engine(kind: &DataSourceKind, password: Option<String>) -> DbResul
                 user,
                 password: password.as_deref(),
                 ssl_mode: *ssl_mode,
+                tls,
+                tls_host,
             })
             .await?;
             Ok(Arc::new(conn))
