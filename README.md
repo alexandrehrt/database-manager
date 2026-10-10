@@ -24,6 +24,18 @@ This builds `Cuia.app`. Drag it into **Applications** and open it from there or 
 signed ad hoc, which is enough on the Mac that built it; sharing it with other Macs needs an Apple Developer ID signature
 and notarization (#56).
 
+### Share it with other Macs
+
+```sh
+scripts/package-macos.sh
+```
+
+This builds `target/dist/Cuia-<version>-macOS.dmg`: a universal app (Apple Silicon and Intel, macOS 11 or later) with
+an Applications shortcut and installation notes. Without an Apple Developer ID the app is signed ad hoc, so the person
+installing it approves it once under System Settings → Privacy & Security → **Open Anyway** (the notes in the image
+explain this). With a Developer ID, set `CUIA_SIGN_IDENTITY` (and `CUIA_NOTARY_PROFILE` for notarization) and the
+image opens without any prompt.
+
 CI also builds the program for Windows (`database-manager.exe`, with the Cuia icon), macOS and Linux on every push to `main`; download it
 from the run's **Artifacts** on the Actions tab.
 

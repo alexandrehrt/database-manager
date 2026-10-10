@@ -1,6 +1,11 @@
 #!/bin/sh
 # Builds "Cuia.app" from a release build.
 # Usage: scripts/bundle-macos.sh [output-dir]   (default: target/release)
+#
+# CUIA_BINARY: use this executable instead of building one (the packaging
+#   script passes a universal arm64 + x86_64 build).
+# CUIA_SIGN_IDENTITY: a "Developer ID Application: …" identity to sign with
+#   (hardened runtime, as notarization requires); unset means an ad-hoc signature.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -8,11 +13,15 @@ out="${1:-target/release}"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 app="$out/Cuia.app"
 
-cargo build --release -p database-manager
+binary="${CUIA_BINARY:-}"
+if [ -z "$binary" ]; then
+    cargo build --release -p database-manager
+    binary=target/release/database-manager
+fi
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/database-manager "$app/Contents/MacOS/database-manager"
+cp "$binary" "$app/Contents/MacOS/database-manager"
 cp crates/app/assets/icon/cuia.icns "$app/Contents/Resources/cuia.icns"
 
 cat > "$app/Contents/Info.plist" <<PLIST
@@ -35,6 +44,10 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature: enough to run locally; distribution needs a Developer ID.
-codesign --force --sign - "$app"
+if [ -n "${CUIA_SIGN_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp --sign "$CUIA_SIGN_IDENTITY" "$app"
+else
+    # Ad-hoc signature: runs on this Mac; other Macs ask to approve it once.
+    codesign --force --sign - "$app"
+fi
 echo "Built $app"
