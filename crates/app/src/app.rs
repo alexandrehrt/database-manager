@@ -661,7 +661,7 @@ impl App {
                     tree.status = ConnStatus::Connected;
                     tree.schemas = Loadable::NotLoaded;
                 }
-                Err(e) => self.tree(&source).status = ConnStatus::Failed(e.to_string()),
+                Err(e) => self.tree(&source).status = ConnStatus::Failed(e.with_detail()),
             },
             Event::ConsoleConnected { console, result } => match result {
                 Ok(conn) => {
@@ -824,7 +824,7 @@ impl App {
                 if let Some(d) = &mut self.dialog
                     && matches!(d.test, Some(TestState::Running(n)) if n == nonce)
                 {
-                    d.test = Some(TestState::Done(result.map_err(|e| e.to_string())));
+                    d.test = Some(TestState::Done(result.map_err(|e| e.with_detail())));
                 }
             }
             Event::Schemas { source, result } => {

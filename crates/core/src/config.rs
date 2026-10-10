@@ -88,6 +88,8 @@ pub enum DataSourceKind {
         user: String,
         #[serde(default)]
         ssl_mode: SslMode,
+        #[serde(default, skip_serializing_if = "TlsFiles::is_empty")]
+        tls: TlsFiles,
     },
     Sqlite {
         path: PathBuf,
@@ -114,13 +116,42 @@ impl DataSourceKind {
     }
 }
 
-/// Subset of libpq's `sslmode`. `Require` encrypts without verifying the
-/// server certificate, matching libpq.
+/// libpq's `sslmode` except `allow`. `Require` encrypts without verifying
+/// the server certificate, matching libpq.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SslMode {
     Disable,
     #[default]
     Prefer,
     Require,
+    /// The certificate must chain to a trusted CA; the host name isn't checked.
+    VerifyCa,
+    /// As `VerifyCa`, and the certificate must name the host.
+    VerifyFull,
+}
+
+impl SslMode {
+    pub fn verifies(self) -> bool {
+        matches!(self, SslMode::VerifyCa | SslMode::VerifyFull)
+    }
+}
+
+/// PEM files for TLS: libpq's `sslrootcert`, `sslcert` and `sslkey`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TlsFiles {
+    /// CA certificate(s) to trust instead of the system's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cert: Option<PathBuf>,
+    /// Client certificate and its private key, for servers that ask for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<PathBuf>,
+}
+
+impl TlsFiles {
+    pub fn is_empty(&self) -> bool {
+        self.root_cert.is_none() && self.client_cert.is_none() && self.client_key.is_none()
+    }
 }
